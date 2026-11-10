@@ -1035,15 +1035,15 @@ fn opt(args: &[String], name: &str) -> Option<String> {
     args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned()
 }
 
-const DEFAULT_APPID: u64 = 480; // 427520 (Factorio) also works for SDR, but the GSLT in use is for 480
+const DEFAULT_APPID: u64 = 427520; // Factorio; SDR host READY + client echo verified
 
-const USAGE: &str = "usage:\n  sdr host   [--appid 480] [--target 127.0.0.1:34197] [--game-port 27016] [--mode 2] [--idle 60] [--debug-level 5] [--gslt-file <path>]\n  sdr client [--appid 480] --host <SteamID64> [--listen 127.0.0.1:34200] [--debug-level 5]\n  sdr play   [--appid 480] --host <SteamID64> [--port 34200] [--connect] [--debug-level 5] -- <game exe> [game args...]\n\
+const USAGE: &str = "usage:\n  sdr host   [--appid 427520] [--target 127.0.0.1:34197] [--game-port 27016] [--mode 2] [--idle 60] [--debug-level 5] [--gslt-file <path>]\n  sdr client [--appid 427520] --host <SteamID64> [--listen 127.0.0.1:34200] [--debug-level 5]\n  sdr play   [--appid 427520] --host <SteamID64> [--port 34200] [--connect] [--debug-level 5] -- <game exe> [game args...]\n\
      play: client tunnel on 127.0.0.1:<port> (busy -> a free port, logged), runs the game, exits with the game's exit code;\n\
            --connect appends --mp-connect 127.0.0.1:<port> to the game command; log sdr.log next to the exe (overwritten)\n\
      all roles: [--send-rate-min 1000000] [--send-rate-max 10000000] (bytes/s, Steam default 256 KB/s) [--ice all|private|public|off]\n\
      --mode: EServerMode 1=NoAuthentication 2=Authentication 3=AuthenticationAndSecure\n\
      --debug-level: Steam networking debug output 0=None 2=Error 4=Warning 5=Msg 6=Verbose 7=Debug 8=Everything\n\
-     --gslt-file: Game Server Login Token file (default: gslt.txt next to the exe if present; env SDR_GSLT also works);\n\
+     --gslt-file: Game Server Login Token file (default: gslt-<appid>.txt, then gslt.txt next to the exe; env SDR_GSLT also works);\n\
                   without a token the host logs on anonymously (new SteamID every run)";
 
 /// Tunnel setup failed: exit 1, but in play mode still run the game (and wait for it) first.
@@ -1062,18 +1062,27 @@ fn usage() -> ! {
     std::process::exit(2)
 }
 
-/// GSLT and where it came from: --gslt-file, else env SDR_GSLT, else gslt.txt next to the exe.
-fn gslt(args: &[String]) -> Result<Option<(String, String)>, String> {
+/// GSLT and where it came from: --gslt-file, else env SDR_GSLT, else gslt-<appid>.txt, else gslt.txt next to the exe.
+fn gslt(args: &[String], appid: u64) -> Result<Option<(String, String)>, String> {
     let (tok, src) = if let Some(p) = opt(args, "--gslt-file") {
         (std::fs::read_to_string(&p).map_err(|e| format!("cannot read --gslt-file {p}: {e}"))?, format!("file {p}"))
     } else if let Ok(t) = std::env::var("SDR_GSLT") {
         (t, "env SDR_GSLT".into())
     } else {
-        let p = exe_dir().join("gslt.txt");
-        match std::fs::read_to_string(&p) {
-            Ok(t) => (t, format!("file {}", p.display())),
-            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(format!("cannot read {}: {e}", p.display())),
+        let mut found = None;
+        for p in [exe_dir().join(format!("gslt-{appid}.txt")), exe_dir().join("gslt.txt")] {
+            match std::fs::read_to_string(&p) {
+                Ok(t) => {
+                    found = Some((t, format!("file {}", p.display())));
+                    break;
+                }
+                Err(e) if e.kind() == ErrorKind::NotFound => {}
+                Err(e) => return Err(format!("cannot read {}: {e}", p.display())),
+            }
+        }
+        match found {
+            Some(f) => f,
+            None => return Ok(None),
         }
     };
     let tok = tok.trim();
@@ -1146,7 +1155,7 @@ fn main() {
     }
 
     let token = if is_host {
-        match gslt(&args).and_then(|t| {
+        match gslt(args, appid).and_then(|t| {
             t.map(|(tok, src)| {
                 let m = mask(&tok);
                 std::ffi::CString::new(tok).map(|c| (c, m, src)).map_err(|_| "GSLT contains a NUL byte".to_string())

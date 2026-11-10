@@ -17,7 +17,7 @@ What it does:
   `steam_api64.dll` and never writes `steam_appid.txt`.
 - The console window from `cmd` stays open while you play; closing it stops the tunnel.
 
-`sdr play` options: `--host <SteamID64>` (required), `--port 34200`, `--appid 480`, `--connect` (also pass
+`sdr play` options: `--host <SteamID64>` (required), `--port 34200`, `--appid 427520`, `--connect` (also pass
 `--mp-connect 127.0.0.1:<port>` to Factorio, so it joins right away once the tunnel is READY or after 20 s).
 
 ## Build
@@ -30,27 +30,28 @@ What it does:
 
 ## Host (server box, no Steam client needed)
 
-    sdr host [--appid 480] [--target 127.0.0.1:34197] [--game-port 27016] [--mode 2] [--idle 60] [--debug-level 5]
+    sdr host [--appid 427520] [--target 127.0.0.1:34197] [--game-port 27016] [--mode 2] [--idle 60] [--debug-level 5]
 
 Logs on as a Steam game server. Wait for the `READY steamid=<id> relay=Current` line and give
 `<id>` to your friends. Each Steam peer gets its own local UDP socket forwarding to `--target`.
 `--mode`: 1 NoAuthentication, 2 Authentication, 3 AuthenticationAndSecure.
-Host and players must use the same `--appid` (480 by default; 427520 = Factorio also works).
+Host and players must use the same `--appid` (427520 = Factorio by default; 480 also works).
 
 ### Persistent SteamID (GSLT)
 
 Anonymous logon gets a new SteamID every run. For a fixed one, use a Game Server Login Token:
 
-1. Create a token at https://steamcommunity.com/dev/managegameservers with App ID = the `--appid` you run with (480 by default).
-2. Put it in `gslt.txt` next to the exe (or pass `--gslt-file <path>`, or set env `SDR_GSLT`).
+1. Create a token at https://steamcommunity.com/dev/managegameservers with App ID = the `--appid` you run with (427520 by default).
+2. Put it in `gslt-<appid>.txt` (e.g. `gslt-427520.txt`) or `gslt.txt` next to the exe (or pass `--gslt-file <path>`, or set env `SDR_GSLT`).
+   Lookup order: `--gslt-file`, `SDR_GSLT`, `gslt-<appid>.txt`, `gslt.txt`.
 3. The log shows `LogOn(token len=N, ****last4) called`; `READY ... type=GameServer` (not `AnonGameServer`) means it worked.
    A bad/expired token shows up as callback 102/103 with its eResult (e.g. `InvalidParam`, `AccessDenied`, `GSLTDenied`, `Expired`).
 
-One token per running server. The token is tied to the Steam account that created it: keep it secret (`gslt.txt` is git-ignored).
+One token per running server. The token is tied to the Steam account that created it: keep it secret (`gslt*.txt` is git-ignored).
 
 ## Client (manual, Steam client running and logged in)
 
-    sdr client [--appid 480] --host <SteamID64 from host> [--listen 127.0.0.1:34200]
+    sdr client [--appid 427520] --host <SteamID64 from host> [--listen 127.0.0.1:34200]
 
 Then in Factorio: Multiplayer -> Connect to address -> `127.0.0.1:34200`.
 
