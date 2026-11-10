@@ -18,6 +18,17 @@ Logs on as an anonymous Steam game server. Wait for the `READY steamid=<id> rela
 `<id>` to your friends. Each Steam peer gets its own local UDP socket forwarding to `--target`.
 `--mode`: 1 NoAuthentication, 2 Authentication, 3 AuthenticationAndSecure.
 
+### Persistent SteamID (GSLT)
+
+Anonymous logon gets a new SteamID every run. For a fixed one, use a Game Server Login Token:
+
+1. Create a token at https://steamcommunity.com/dev/managegameservers with App ID = the `--appid` you run with (480 by default).
+2. Put it in `gslt.txt` next to the exe (or pass `--gslt-file <path>`, or set env `SDR_GSLT`).
+3. The log shows `LogOn(token len=N, ****last4) called`; `READY ... type=GameServer` (not `AnonGameServer`) means it worked.
+   A bad/expired token shows up as callback 102/103 with its eResult (e.g. `InvalidParam`, `AccessDenied`, `GSLTDenied`, `Expired`).
+
+One token per running server. The token is tied to the Steam account that created it: keep it secret (`gslt.txt` is git-ignored).
+
 ## Client (friend's PC, Steam client running and logged in)
 
     sdr-tunnel client --appid 480 --host <SteamID64 from host> [--listen 127.0.0.1:34200]

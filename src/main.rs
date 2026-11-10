@@ -210,6 +210,7 @@ struct Api {
     gs_set_moddir: unsafe extern "C" fn(P, *const c_char),
     gs_set_dedicated: unsafe extern "C" fn(P, u8),
     gs_logon_anon: unsafe extern "C" fn(P),
+    gs_logon: unsafe extern "C" fn(P, *const c_char),
     gs_logoff: unsafe extern "C" fn(P),
     gs_logged_on: unsafe extern "C" fn(P) -> u8,
     gs_secure: unsafe extern "C" fn(P) -> u8,
@@ -285,6 +286,7 @@ fn load_api() -> Result<Api, String> {
         gs_set_moddir: s!("SteamAPI_ISteamGameServer_SetModDir"),
         gs_set_dedicated: s!("SteamAPI_ISteamGameServer_SetDedicatedServer"),
         gs_logon_anon: s!("SteamAPI_ISteamGameServer_LogOnAnonymous"),
+        gs_logon: s!("SteamAPI_ISteamGameServer_LogOn"),
         gs_logoff: s!("SteamAPI_ISteamGameServer_LogOff"),
         gs_logged_on: s!("SteamAPI_ISteamGameServer_BLoggedOn"),
         gs_secure: s!("SteamAPI_ISteamGameServer_BSecure"),
@@ -787,7 +789,7 @@ impl Ctx {
         self.sessions_diag();
         let ready = logged != 0 && steamid_valid(sid) && relay == 100;
         if ready && !self.ready {
-            log!("READY steamid={sid} relay=Current auth={}", avail_name(auth));
+            log!("READY steamid={sid} relay=Current auth={} id={}", avail_name(auth), steamid_desc(sid));
         } else if !ready && self.ready {
             log!("NOT READY any more (logged={logged} steamid={sid} relay={})", avail_name(relay));
         }
@@ -842,17 +844,48 @@ fn opt(args: &[String], name: &str) -> Option<String> {
     args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned()
 }
 
+const USAGE: &str = "usage:\n  sdr-tunnel host   [--appid 480] [--target 127.0.0.1:34197] [--game-port 27016] [--mode 2] [--idle 60] [--debug-level 5] [--gslt-file <path>]\n  sdr-tunnel client [--appid 480] --host <SteamID64> [--listen 127.0.0.1:34200] [--debug-level 5]\n\
+     --mode: EServerMode 1=NoAuthentication 2=Authentication 3=AuthenticationAndSecure\n\
+     --debug-level: Steam networking debug output 0=None 2=Error 4=Warning 5=Msg 6=Verbose 7=Debug 8=Everything\n\
+     --gslt-file: Game Server Login Token file (default: gslt.txt next to the exe if present; env SDR_GSLT also works);\n\
+                  without a token the host logs on anonymously (new SteamID every run)";
+
 fn usage() -> ! {
-    eprintln!(
-        "usage:\n  sdr-tunnel host   [--appid 480] [--target 127.0.0.1:34197] [--game-port 27016] [--mode 2] [--idle 60] [--debug-level 5]\n  sdr-tunnel client [--appid 480] --host <SteamID64> [--listen 127.0.0.1:34200] [--debug-level 5]\n\
-         --mode: EServerMode 1=NoAuthentication 2=Authentication 3=AuthenticationAndSecure\n\
-         --debug-level: Steam networking debug output 0=None 2=Error 4=Warning 5=Msg 6=Verbose 7=Debug 8=Everything"
-    );
+    eprintln!("{USAGE}");
     std::process::exit(2)
+}
+
+/// GSLT and where it came from: --gslt-file, else env SDR_GSLT, else gslt.txt next to the exe.
+fn gslt(args: &[String]) -> Result<Option<(String, String)>, String> {
+    let (tok, src) = if let Some(p) = opt(args, "--gslt-file") {
+        (std::fs::read_to_string(&p).map_err(|e| format!("cannot read --gslt-file {p}: {e}"))?, format!("file {p}"))
+    } else if let Ok(t) = std::env::var("SDR_GSLT") {
+        (t, "env SDR_GSLT".into())
+    } else {
+        let p = exe_dir().join("gslt.txt");
+        match std::fs::read_to_string(&p) {
+            Ok(t) => (t, format!("file {}", p.display())),
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(format!("cannot read {}: {e}", p.display())),
+        }
+    };
+    let tok = tok.trim();
+    Ok((!tok.is_empty()).then(|| (tok.to_string(), src)))
+}
+
+/// Token for the log: never the token itself.
+fn mask(tok: &str) -> String {
+    let n = tok.chars().count();
+    let last4: String = if n >= 8 { tok.chars().skip(n - 4).collect() } else { String::new() };
+    format!("token len={n}, ****{last4}")
 }
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    if args.iter().skip(1).any(|a| a == "-h" || a == "--help" || a == "help") {
+        println!("{USAGE}");
+        return;
+    }
     let role = args.get(1).map(String::as_str).unwrap_or("");
     let is_host = match role {
         "host" => true,
@@ -883,6 +916,24 @@ fn main() {
         Ok(()) => log!("wrote {} = {appid}", appid_file.display()),
         Err(e) => log!("cannot write {}: {e}", appid_file.display()),
     }
+
+    let token = if is_host {
+        match gslt(&args).and_then(|t| {
+            t.map(|(tok, src)| {
+                let m = mask(&tok);
+                std::ffi::CString::new(tok).map(|c| (c, m, src)).map_err(|_| "GSLT contains a NUL byte".to_string())
+            })
+            .transpose()
+        }) {
+            Ok(t) => t,
+            Err(e) => {
+                log!("FATAL: {e}");
+                std::process::exit(1);
+            }
+        }
+    } else {
+        None
+    };
 
     let api = match load_api() {
         Ok(a) => a,
@@ -984,9 +1035,16 @@ fn main() {
         log!("InitRelayNetworkAccess done");
         let a = (api.init_auth)(sockets);
         log!("InitAuthentication = {a} ({})", avail_name(a));
-        if is_host {
-            (api.gs_logon_anon)(gs);
-            log!("LogOnAnonymous called");
+        match &token {
+            Some((tok, m, src)) => {
+                (api.gs_logon)(gs, tok.as_ptr());
+                log!("LogOn({m}) called, token from {src}; result in callback 101 (ok) / 102 / 103 eResult");
+            }
+            None if is_host => {
+                (api.gs_logon_anon)(gs);
+                log!("LogOnAnonymous called (no GSLT: SteamID changes every run)");
+            }
+            None => {}
         }
     }
     let mut ctx = Ctx { api, pipe, is_host, gs, user, msgs, sockets, utils, ready: false, role: role_state };
@@ -1005,5 +1063,11 @@ mod tests {
         assert!(steamid_desc(id).contains("type=AnonGameServer universe=Public account=12345"));
         assert!(id.to_string().starts_with("9007"));
         assert!(!steamid_valid(0));
+    }
+
+    #[test]
+    fn mask_hides_token() {
+        assert_eq!(mask("0123456789ABCDEF"), "token len=16, ****CDEF");
+        assert_eq!(mask("abc"), "token len=3, ****");
     }
 }
