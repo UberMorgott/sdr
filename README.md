@@ -37,7 +37,8 @@ What it does:
     sdr host [--appid 427520] [--target 127.0.0.1:34197] [--game-port 27016] [--mode 2] [--idle 60] [--debug-level 5]
 
 Logs on as a Steam game server. Wait for the `READY steamid=<id> relay=Current` line and give
-`<id>` to your friends. Each Steam peer gets its own local UDP socket forwarding to `--target`.
+`<id>` to your friends. Each Steam peer gets its own local UDP socket forwarding to `--target` (IPv4 only);
+a peer idle in both directions for `--idle` seconds is dropped. `client`/`play` accept Steam sessions from `--host` only.
 `--mode`: 1 NoAuthentication, 2 Authentication, 3 AuthenticationAndSecure.
 Host and players must use the same `--appid` (427520 = Factorio by default; 480 also works).
 
@@ -84,12 +85,20 @@ Then in Factorio: Multiplayer -> Connect to address -> `127.0.0.1:34200`.
   carries: above it the excess is lost and goodput collapses. Measured 2026-11-11 Georgia <- St. Petersburg
   (relay vie/sto, ping 94 ms), 12 s UDP blasts: min 0.5 MB/s -> 0.48 MB/s clean; 1 MB/s -> 0.75-0.96 MB/s;
   1.3 MB/s -> 1.2 MB/s once; 2 MB/s -> 0.7 MB/s (quality 0.65); 4 MB/s -> 0.28 MB/s (quality 0.3).
-  So the default 1 MB/s stays.
+  Re-measured with v0.3.0 (4 MiB socket/Steam buffers), 10 s blasts, 3+ runs each, loss per run:
+  1 MB/s 0-3.1 % (quality 0.96-1.0); 1.2 MB/s 0, 0, 6.8 %; 1.3 MB/s 0-15 %; 1.5 MB/s 46-51 % (quality 0.7);
+  2 MB/s 70-76 % (quality 0.5). The path itself caps near 1.2 MB/s and has bad minutes (~25 % loss at any rate),
+  so the bigger buffers do not move the cliff: the default 1 MB/s stays.
+- `--send-buffer 4194304` (bytes): Steam's per-session SendBufferSize (default 512 KB). When it is full,
+  SendMessage returns `LimitExceeded`; such datagrams wait in a small per-peer retry queue (max 50 ms / 1 MB),
+  then are dropped. The `SESSION` log line counts `LimitExceeded`, the retry queue and drops.
+- Local UDP sockets get 4 MiB `SO_RCVBUF`/`SO_SNDBUF` (Windows default 64 KB); the read-back is logged.
 - `--ice all|private|public|off` (default `all`): allow direct P2P (ICE) besides relays. The log shows `ROUTE ... RELAYED|DIRECT`.
 
 ## Logs
 
-stdout and `sdr-<role>.log` next to the exe (`host`/`client`: appended; `play`: `sdr.log`, overwritten), flushed per line:
+stdout and `sdr-<role>.log` next to the exe (`host`/`client`: appended; `play`: `sdr.log`, overwritten), written by a
+logger thread and flushed per line (a full queue drops lines and logs how many):
 every init call and result, every Steam callback by id, Steam networking debug output (`steamnet[...]`), a diag block
 every 2 s until READY, every 30 s after (logon, SteamID, public IP, relay/auth status, ping location), per-session
 state and realtime stats (`RT`: ping, quality, in/out rate, send rate, queue) every 5 s, and the 10 best relay POPs
