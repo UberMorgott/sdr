@@ -1035,9 +1035,9 @@ fn opt(args: &[String], name: &str) -> Option<String> {
     args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned()
 }
 
-const DEFAULT_APPID: u64 = 427520; // Factorio: SDR works with it (tested), Steam shows the right game
+const DEFAULT_APPID: u64 = 480; // 427520 (Factorio) also works for SDR, but the GSLT in use is for 480
 
-const USAGE: &str = "usage:\n  sdr host   [--appid 427520] [--target 127.0.0.1:34197] [--game-port 27016] [--mode 2] [--idle 60] [--debug-level 5] [--gslt-file <path>]\n  sdr client [--appid 427520] --host <SteamID64> [--listen 127.0.0.1:34200] [--debug-level 5]\n  sdr play   [--appid 427520] --host <SteamID64> [--port 34200] [--connect] [--debug-level 5] -- <game exe> [game args...]\n\
+const USAGE: &str = "usage:\n  sdr host   [--appid 480] [--target 127.0.0.1:34197] [--game-port 27016] [--mode 2] [--idle 60] [--debug-level 5] [--gslt-file <path>]\n  sdr client [--appid 480] --host <SteamID64> [--listen 127.0.0.1:34200] [--debug-level 5]\n  sdr play   [--appid 480] --host <SteamID64> [--port 34200] [--connect] [--debug-level 5] -- <game exe> [game args...]\n\
      play: client tunnel on 127.0.0.1:<port> (busy -> a free port, logged), runs the game, exits with the game's exit code;\n\
            --connect appends --mp-connect 127.0.0.1:<port> to the game command; log sdr.log next to the exe (overwritten)\n\
      all roles: [--send-rate-min 1000000] [--send-rate-max 10000000] (bytes/s, Steam default 256 KB/s) [--ice all|private|public|off]\n\
