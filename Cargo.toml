@@ -1,11 +1,11 @@
 [package]
 name = "sdr"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "UDP <-> Steam Datagram Relay tunnel (anonymous game server host / Steam client) with verbose Steam logging"
 
 [dependencies]
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_Console", "Win32_System_LibraryLoader", "Win32_System_SystemInformation"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Networking_WinSock", "Win32_System_Console", "Win32_System_LibraryLoader", "Win32_System_SystemInformation"] }
 
 [profile.release]
 opt-level = 3

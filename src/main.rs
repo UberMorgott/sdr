@@ -19,21 +19,29 @@ use std::collections::HashMap;
 use std::ffi::{c_char, c_void, CStr};
 use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Write};
+use std::collections::VecDeque;
 use std::net::{SocketAddr, UdpSocket};
+use std::os::windows::io::AsRawSocket;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{sync_channel, SyncSender};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use windows_sys::core::BOOL;
 use windows_sys::Win32::Foundation::SYSTEMTIME;
+use windows_sys::Win32::Networking::WinSock::{getsockopt, setsockopt, SOL_SOCKET, SO_RCVBUF, SO_SNDBUF};
 use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
 use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 use windows_sys::Win32::System::SystemInformation::GetLocalTime;
 
 // ------------------------------------------------------------------ logging
 
-static LOG: Mutex<Option<File>> = Mutex::new(None);
+/// Lines go to one logger thread (stdout + file I/O): no caller, least of all Steam's service thread, blocks on I/O.
+static LOG: OnceLock<SyncSender<String>> = OnceLock::new();
+static LOG_SENT: AtomicU64 = AtomicU64::new(0);
+static LOG_WRITTEN: AtomicU64 = AtomicU64::new(0);
+static LOG_DROPPED: AtomicU64 = AtomicU64::new(0);
 static STOP: AtomicBool = AtomicBool::new(false);
 
 macro_rules! log {
@@ -47,15 +55,51 @@ fn log_line(s: &str) {
         "{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:03} {s}\n",
         t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond, t.wMilliseconds
     );
-    // Steam's debug-output callback may come from its own threads: one lock for both sinks.
-    let mut g = LOG.lock().unwrap_or_else(|e| e.into_inner());
-    let mut out = std::io::stdout().lock();
-    let _ = out.write_all(line.as_bytes());
-    let _ = out.flush();
-    if let Some(f) = g.as_mut() {
-        let _ = f.write_all(line.as_bytes());
-        let _ = f.flush();
+    match LOG.get() {
+        // Never blocks: a full queue drops the line and counts it.
+        Some(tx) => match tx.try_send(line) {
+            Ok(()) => {
+                LOG_SENT.fetch_add(1, Ordering::SeqCst);
+            }
+            Err(_) => {
+                LOG_DROPPED.fetch_add(1, Ordering::Relaxed);
+            }
+        },
+        None => print!("{line}"),
     }
+}
+
+fn log_init(mut file: Option<File>) {
+    let (tx, rx) = sync_channel::<String>(8192);
+    std::thread::spawn(move || {
+        let mut reported = 0;
+        for line in rx {
+            let dropped = LOG_DROPPED.load(Ordering::Relaxed);
+            let note = (dropped != reported).then(|| format!("[logger: {} lines dropped, queue full]\n", dropped - reported));
+            reported = dropped;
+            for l in note.iter().chain([&line]) {
+                let mut out = std::io::stdout().lock();
+                let _ = out.write_all(l.as_bytes());
+                let _ = out.flush();
+                if let Some(f) = file.as_mut() {
+                    let _ = f.write_all(l.as_bytes());
+                    let _ = f.flush();
+                }
+            }
+            LOG_WRITTEN.fetch_add(1, Ordering::SeqCst);
+        }
+    });
+    let _ = LOG.set(tx);
+}
+
+/// Exit after the logger wrote what is queued (max 2 s).
+fn exit(code: i32) -> ! {
+    let t = Instant::now();
+    while LOG_WRITTEN.load(Ordering::SeqCst) < LOG_SENT.load(Ordering::SeqCst) && t.elapsed() < Duration::from_secs(2) {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    DONE.store(true, Ordering::SeqCst);
+    std::process::exit(code)
 }
 
 fn exe_dir() -> PathBuf {
@@ -63,6 +107,22 @@ fn exe_dir() -> PathBuf {
         .ok()
         .and_then(|p| p.parent().map(PathBuf::from))
         .unwrap_or_else(|| PathBuf::from("."))
+}
+
+const SOCK_BUF: i32 = 4 << 20;
+
+/// SO_RCVBUF/SO_SNDBUF to 4 MiB (Windows default 64 KB drops bursts); returns the read-back for the log.
+fn tune_sock(s: &UdpSocket) -> String {
+    let h = s.as_raw_socket() as usize;
+    let mut r = Vec::new();
+    for (name, opt) in [("SO_RCVBUF", SO_RCVBUF), ("SO_SNDBUF", SO_SNDBUF)] {
+        let (mut v, mut n) = (0i32, 4i32);
+        // SAFETY: h is a live socket; v/n are valid i32 buffers of the given length.
+        let set = unsafe { setsockopt(h, SOL_SOCKET, opt, (&SOCK_BUF as *const i32).cast(), 4) };
+        let get = unsafe { getsockopt(h, SOL_SOCKET, opt, (&mut v as *mut i32).cast(), &mut n) };
+        r.push(format!("{name} set {SOCK_BUF}={set} get={get} value {v}"));
+    }
+    r.join(", ")
 }
 
 fn cbuf(b: &[u8]) -> String {
@@ -185,6 +245,7 @@ struct RtStatus {
 }
 
 // ESteamNetworkingConfigValue / Scope / DataType (steamnetworkingtypes.h).
+const CFG_SEND_BUFFER_SIZE: i32 = 9; // SDK default 512 KB; full -> SendMessage returns k_EResultLimitExceeded
 const CFG_SEND_RATE_MIN: i32 = 10;
 const CFG_SEND_RATE_MAX: i32 = 11;
 const CFG_SCOPE_GLOBAL: i32 = 1;
@@ -506,6 +567,7 @@ unsafe extern "C" fn steam_debug(typ: i32, msg: *const c_char) {
         // SAFETY: Steam passes a NUL-terminated string.
         unsafe { CStr::from_ptr(msg) }.to_string_lossy().into_owned()
     };
+    // Runs on Steam's service thread: log_line only formats + try_send, never blocks.
     log!("steamnet[{t}] {}", s.trim_end());
 }
 
@@ -594,11 +656,76 @@ struct Counters {
     tx_pkts: u64,
     tx_bytes: u64,
     last_send_err: i32,
+    /// UDP->SDR datagrams waiting after k_EResultLimitExceeded (Steam send buffer full), oldest first.
+    q: VecDeque<(Instant, Vec<u8>)>,
+    q_bytes: usize,
+    limit_hits: u64,
+    dropped: u64,
 }
 
 impl Counters {
     fn new() -> Counters {
-        Counters { rx_pkts: 0, rx_bytes: 0, tx_pkts: 0, tx_bytes: 0, last_send_err: 1 }
+        Counters {
+            rx_pkts: 0,
+            rx_bytes: 0,
+            tx_pkts: 0,
+            tx_bytes: 0,
+            last_send_err: 1,
+            q: VecDeque::new(),
+            q_bytes: 0,
+            limit_hits: 0,
+            dropped: 0,
+        }
+    }
+}
+
+const RESULT_LIMIT_EXCEEDED: i32 = 25; // k_EResultLimitExceeded
+const RETRY_MAX_AGE: Duration = Duration::from_millis(50);
+const RETRY_MAX_BYTES: usize = 1 << 20;
+/// Per socket per main-loop pass, so callbacks / stop / child-exit checks keep running under load.
+const DRAIN_MAX_PKTS: usize = 256;
+const DRAIN_MAX_BYTES: usize = 1 << 20;
+
+/// Queue one UDP->SDR datagram behind any retries (keeps order), then send what Steam takes.
+fn sdr_send(api: &Api, msgs: P, to: u64, data: &[u8], c: &mut Counters) {
+    c.q.push_back((Instant::now(), data.to_vec()));
+    c.q_bytes += data.len();
+    sdr_flush(api, msgs, to, c);
+}
+
+fn sdr_flush(api: &Api, msgs: P, to: u64, c: &mut Counters) {
+    let id = Identity::steam(to);
+    while let Some((t, d)) = c.q.front() {
+        if t.elapsed() <= RETRY_MAX_AGE {
+            // SAFETY: msgs live, id/d valid for the call.
+            let r = unsafe { (api.send)(msgs, &id, d.as_ptr().cast(), d.len() as u32, SEND_FLAGS, CHANNEL) };
+            if r == RESULT_LIMIT_EXCEEDED {
+                c.limit_hits += 1;
+                break; // retried next loop pass
+            }
+            if r == 1 {
+                if c.tx_pkts == 0 {
+                    log!("first datagram UDP->SDR to {to}: {} bytes", d.len());
+                }
+                c.tx_pkts += 1;
+                c.tx_bytes += d.len() as u64;
+            } else {
+                c.dropped += 1;
+            }
+            if r != c.last_send_err {
+                log!("SendMessageToUser({to}, {} bytes) = {}", d.len(), eres(r));
+                c.last_send_err = r;
+            }
+        } else {
+            c.dropped += 1;
+        }
+        let (_, d) = c.q.pop_front().unwrap();
+        c.q_bytes -= d.len();
+    }
+    while c.q_bytes > RETRY_MAX_BYTES {
+        let (_, d) = c.q.pop_front().unwrap();
+        c.q_bytes -= d.len();
+        c.dropped += 1;
     }
 }
 
@@ -631,25 +758,6 @@ struct Ctx {
 }
 
 impl Ctx {
-    fn send(&self, to: u64, data: &[u8], c: &mut Counters) {
-        let id = Identity::steam(to);
-        // SAFETY: msgs live, id/data valid for the call.
-        let r = unsafe {
-            (self.api.send)(self.msgs, &id, data.as_ptr().cast(), data.len() as u32, SEND_FLAGS, CHANNEL)
-        };
-        if r == 1 {
-            if c.tx_pkts == 0 {
-                log!("first datagram UDP->SDR to {to}: {} bytes", data.len());
-            }
-            c.tx_pkts += 1;
-            c.tx_bytes += data.len() as u64;
-        }
-        if r != c.last_send_err {
-            log!("SendMessageToUser({to}, {} bytes) = {}", data.len(), eres(r));
-            c.last_send_err = r;
-        }
-    }
-
     fn on_callback(&mut self, cb: &CallbackMsg) {
         let name = names::callback(cb.id);
         let p = cb.param;
@@ -687,9 +795,20 @@ impl Ctx {
             }
             1251 if size >= 136 => {
                 let id = unsafe { p.cast::<Identity>().read_unaligned() };
-                // SAFETY: msgs live, id valid.
-                let ok = unsafe { (self.api.accept)(self.msgs, &id) };
-                format!("identityRemote type={} steamid={} -> AcceptSessionWithUser = {ok}", id.typ, steamid_desc(id.steam_id))
+                let who = format!("identityRemote type={} steamid={}", id.typ, steamid_desc(id.steam_id));
+                match self.role {
+                    // client/play talks to its host only.
+                    Role::Client { host, .. } if id.typ != IDENTITY_STEAMID || id.steam_id != host => {
+                        // SAFETY: msgs live, id valid.
+                        let ok = unsafe { (self.api.close)(self.msgs, &id) };
+                        format!("{who} is not our host {host} -> REJECTED, CloseSessionWithUser = {ok}")
+                    }
+                    _ => {
+                        // SAFETY: msgs live, id valid.
+                        let ok = unsafe { (self.api.accept)(self.msgs, &id) };
+                        format!("{who} -> AcceptSessionWithUser = {ok}")
+                    }
+                }
             }
             _ => {
                 let n = size.min(32);
@@ -743,9 +862,10 @@ impl Ctx {
                                 }
                             };
                             log!(
-                                "NEW PEER {}: local socket {} -> target {target}",
+                                "NEW PEER {}: local socket {} -> target {target}; {}",
                                 steamid_desc(from),
-                                sock.local_addr().map(|a| a.to_string()).unwrap_or_default()
+                                sock.local_addr().map(|a| a.to_string()).unwrap_or_default(),
+                                tune_sock(&sock)
                             );
                             e.insert(Peer { sock, last: Instant::now(), c: Counters::new() })
                         }
@@ -787,53 +907,45 @@ impl Ctx {
     /// UDP -> SDR.
     fn pump_udp(&mut self) -> bool {
         let mut buf = [0u8; 65536];
+        let (api, msgs) = (&self.api, self.msgs);
         let mut any = false;
-        // Out-of-borrow sends: collect then send.
-        let mut out: Vec<(u64, Vec<u8>)> = Vec::new();
-        match &mut self.role {
-            Role::Host { peers, .. } => {
-                for (&id, p) in peers.iter_mut() {
-                    loop {
-                        match p.sock.recv_from(&mut buf) {
-                            Ok((n, _)) => out.push((id, buf[..n].to_vec())),
-                            Err(e) if e.kind() == ErrorKind::WouldBlock => break,
-                            // Windows reports an ICMP port-unreachable from the target as ConnectionReset.
-                            Err(e) => {
-                                log!("peer {id}: local recv error: {e}");
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-            Role::Client { host, sock, local, .. } => loop {
+        // Bounded drain: at most DRAIN_MAX_PKTS / DRAIN_MAX_BYTES per socket, sent straight on.
+        let mut drain = |sock: &UdpSocket, to: u64, c: &mut Counters, mut on_src: Option<&mut Option<SocketAddr>>| -> bool {
+            sdr_flush(api, msgs, to, c);
+            let (mut pkts, mut bytes) = (0, 0);
+            while pkts < DRAIN_MAX_PKTS && bytes < DRAIN_MAX_BYTES {
                 match sock.recv_from(&mut buf) {
                     Ok((n, src)) => {
-                        if *local != Some(src) {
-                            log!("local UDP sender is now {src}");
-                            *local = Some(src);
+                        if let Some(local) = on_src.as_deref_mut() {
+                            if *local != Some(src) {
+                                log!("local UDP sender is now {src}");
+                                *local = Some(src);
+                            }
                         }
-                        out.push((*host, buf[..n].to_vec()));
+                        sdr_send(api, msgs, to, &buf[..n], c);
+                        pkts += 1;
+                        bytes += n;
                     }
                     Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+                    // Windows reports an ICMP port-unreachable from the target as ConnectionReset.
                     Err(e) => {
-                        log!("listen socket recv error: {e}");
+                        log!("UDP socket for {to}: local recv error: {e}");
                         break;
                     }
                 }
-            },
-        }
-        for (id, data) in out {
-            any = true;
-            let mut c = match &mut self.role {
-                Role::Host { peers, .. } => std::mem::replace(&mut peers.get_mut(&id).unwrap().c, Counters::new()),
-                Role::Client { c, .. } => std::mem::replace(c, Counters::new()),
-            };
-            self.send(id, &data, &mut c);
-            match &mut self.role {
-                Role::Host { peers, .. } => peers.get_mut(&id).unwrap().c = c,
-                Role::Client { c: cc, .. } => *cc = c,
             }
+            pkts > 0
+        };
+        match &mut self.role {
+            Role::Host { peers, .. } => {
+                for (&id, p) in peers.iter_mut() {
+                    if drain(&p.sock, id, &mut p.c, None) {
+                        p.last = Instant::now();
+                        any = true;
+                    }
+                }
+            }
+            Role::Client { host, sock, local, c } => any = drain(sock, *host, c, Some(local)),
         }
         any
     }
@@ -843,6 +955,7 @@ impl Ctx {
         let dead: Vec<u64> = peers.iter().filter(|(_, p)| p.last.elapsed() > *idle).map(|(&id, _)| id).collect();
         for id in dead {
             let p = peers.remove(&id).unwrap();
+            self.routes.borrow_mut().remove(&id);
             let ident = Identity::steam(id);
             // SAFETY: msgs live.
             let ok = unsafe { (self.api.close)(self.msgs, &ident) };
@@ -869,13 +982,17 @@ impl Ctx {
             // SAFETY: msgs live; info and rt writable.
             let s = unsafe { (self.api.conn_info)(self.msgs, &ident, &mut info, &mut rt) };
             log!(
-                "SESSION {id}: GetSessionConnectionInfo={s} ({}) {} | rx {} pkts/{} B, tx {} pkts/{} B",
+                "SESSION {id}: GetSessionConnectionInfo={s} ({}) {} | rx {} pkts/{} B, tx {} pkts/{} B, LimitExceeded {} retry-queue {} pkts/{} B dropped {}",
                 state_name(s),
                 conn_desc(&info),
                 c.rx_pkts,
                 c.rx_bytes,
                 c.tx_pkts,
-                c.tx_bytes
+                c.tx_bytes,
+                c.limit_hits,
+                c.q.len(),
+                c.q_bytes,
+                c.dropped
             );
             let route = (info.flags & 16, info.pop_relay);
             if s == 3 && self.routes.borrow_mut().insert(id, route) != Some(route) {
@@ -1025,7 +1142,6 @@ impl Ctx {
                 log!("SteamAPI_Shutdown called");
             }
         }
-        DONE.store(true, Ordering::SeqCst);
     }
 }
 
@@ -1041,6 +1157,7 @@ const USAGE: &str = "usage:\n  sdr host   [--appid 427520] [--target 127.0.0.1:3
      play: client tunnel on 127.0.0.1:<port> (busy -> a free port, logged), runs the game, exits with the game's exit code;\n\
            --connect appends --mp-connect 127.0.0.1:<port> to the game command; log sdr.log next to the exe (overwritten)\n\
      all roles: [--send-rate-min 1000000] [--send-rate-max 10000000] (bytes/s, Steam default 256 KB/s) [--ice all|private|public|off]\n\
+                [--send-buffer 4194304] (Steam SendBufferSize bytes, Steam default 512 KB)\n\
      --mode: EServerMode 1=NoAuthentication 2=Authentication 3=AuthenticationAndSecure\n\
      --debug-level: Steam networking debug output 0=None 2=Error 4=Warning 5=Msg 6=Verbose 7=Debug 8=Everything\n\
      --gslt-file: Game Server Login Token file (default: gslt-<appid>.txt, then gslt.txt next to the exe; env SDR_GSLT also works);\n\
@@ -1048,18 +1165,18 @@ const USAGE: &str = "usage:\n  sdr host   [--appid 427520] [--target 127.0.0.1:3
 
 /// Tunnel setup failed: exit 1, but in play mode still run the game (and wait for it) first.
 fn die(play: &mut Option<Play>) -> ! {
-    let Some(p) = play else { std::process::exit(1) };
+    let Some(p) = play else { exit(1) };
     log!("tunnel unavailable; launching the game without it");
     p.wait = false;
     while !p.poll(false) {
         std::thread::sleep(Duration::from_millis(200));
     }
-    std::process::exit(p.code.unwrap_or(1))
+    exit(p.code.unwrap_or(1))
 }
 
 fn usage() -> ! {
     eprintln!("{USAGE}");
-    std::process::exit(2)
+    exit(2)
 }
 
 /// GSLT and where it came from: --gslt-file, else env SDR_GSLT, else gslt-<appid>.txt, else gslt.txt next to the exe.
@@ -1120,6 +1237,7 @@ fn main() {
     let debug_level = num("--debug-level", 5) as i32;
     let rate_min = num("--send-rate-min", 1_000_000).min(i32::MAX as u64) as i32;
     let rate_max = num("--send-rate-max", 10_000_000).min(i32::MAX as u64) as i32;
+    let send_buffer = num("--send-buffer", 4 << 20).min(i32::MAX as u64) as i32;
     let ice = match opt(args, "--ice").as_deref().unwrap_or("all") {
         "all" => 0x7fff_ffff,
         "private" => 2,
@@ -1130,10 +1248,13 @@ fn main() {
 
     // play: one log, overwritten per run (it lives in the game folder).
     let log_path = exe_dir().join(if is_play { "sdr.log".to_string() } else { format!("sdr-{role}.log") });
-    match OpenOptions::new().create(true).write(true).append(!is_play).truncate(is_play).open(&log_path) {
-        Ok(f) => *LOG.lock().unwrap() = Some(f),
-        Err(e) => eprintln!("cannot open {}: {e}; logging to stdout only", log_path.display()),
-    }
+    log_init(match OpenOptions::new().create(true).write(true).append(!is_play).truncate(is_play).open(&log_path) {
+        Ok(f) => Some(f),
+        Err(e) => {
+            eprintln!("cannot open {}: {e}; logging to stdout only", log_path.display());
+            None
+        }
+    });
     log!("==== sdr {} {role} start, args {:?}, log {}", env!("CARGO_PKG_VERSION"), &all[1..], log_path.display());
     // SAFETY: handler only touches atomics and sleeps.
     let ok = unsafe { SetConsoleCtrlHandler(Some(on_ctrl), 1) };
@@ -1165,7 +1286,7 @@ fn main() {
             Ok(t) => t,
             Err(e) => {
                 log!("FATAL: {e}");
-                std::process::exit(1);
+                exit(1);
             }
         }
     } else {
@@ -1201,6 +1322,11 @@ fn main() {
             .unwrap_or_else(|| "127.0.0.1:34197".into())
             .parse()
             .unwrap_or_else(|_| usage());
+        // shortcut: per-peer sockets bind 127.0.0.1, so IPv4 targets only; bind [::1] per family if IPv6 is ever needed.
+        if !target.is_ipv4() {
+            log!("FATAL: --target {target}: only IPv4 targets are supported");
+            exit(1);
+        }
         let game_port = num("--game-port", 27016) as u16;
         let mode = num("--mode", 2) as i32;
         let mode_name = match mode {
@@ -1221,7 +1347,7 @@ fn main() {
         };
         log!("SteamInternal_GameServer_Init_V2 = {r} ({}) errMsg='{}'", init_result_name(r), cbuf(&err));
         if r != 0 {
-            std::process::exit(1);
+            exit(1);
         }
         unsafe {
             pipe = (api.gs_pipe)();
@@ -1270,7 +1396,7 @@ fn main() {
             }
         };
         let local = sock.local_addr().map(|a| a.to_string()).unwrap_or(listen);
-        log!("listening for local UDP on {local}");
+        log!("listening for local UDP on {local}; {}", tune_sock(&sock));
         if let (Some(p), true) = (&mut play, connect) {
             p.cmd.extend(["--mp-connect".to_string(), local]);
         }
@@ -1302,6 +1428,7 @@ fn main() {
         for (name, cfg, v) in [
             ("SendRateMin", CFG_SEND_RATE_MIN, rate_min),
             ("SendRateMax", CFG_SEND_RATE_MAX, rate_max),
+            ("SendBufferSize", CFG_SEND_BUFFER_SIZE, send_buffer),
             ("P2P_Transport_ICE_Enable", CFG_ICE_ENABLE, ice),
         ] {
             let ok = (api.set_cfg_i32)(utils, cfg, v);
@@ -1329,7 +1456,7 @@ fn main() {
     ctx.run();
     let code = ctx.play.and_then(|p| p.code).unwrap_or(0);
     log!("exit {code}");
-    std::process::exit(code);
+    exit(code);
 }
 
 #[cfg(test)]
