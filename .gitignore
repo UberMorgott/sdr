@@ -1,0 +1,4 @@
+/target/
+*.dll
+*.log
+steam_appid.txt
