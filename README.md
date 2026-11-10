@@ -4,14 +4,18 @@ UDP <-> Steam Datagram Relay tunnel, so friends reach a UDP game server (Factori
 
 ## Players: just click Play
 
-Steam -> Factorio -> Properties -> Launch options (replace `<HOST_ID>` with the SteamID64 the host gives you):
+Steam -> Factorio -> Properties -> Launch options (our server's host ID is `85568392936999921`, fixed via GSLT):
 
-    cmd /c "curl -sfLRz sdr.exe --remove-on-error --connect-timeout 5 -o sdr.exe https://github.com/UberMorgott/sdr/releases/latest/download/sdr.exe & .\sdr.exe play --host <HOST_ID> -- %command%"
+    cmd /c "curl -sfLRz sdr.exe --remove-on-error --connect-timeout 5 -o sdr.exe https://github.com/UberMorgott/sdr/releases/latest/download/sdr.exe & .\sdr.exe play --host 85568392936999921 -- %command%"
+
+For another server replace the ID with the SteamID64 its host prints (`READY steamid=<id>`).
+Start Factorio with Steam's Play button: started outside Steam, Factorio quits at once while `sdr` holds the Steam API.
 
 What it does:
 - `curl -z` downloads `sdr.exe` into the Factorio folder only when the release is newer (HTTP 304 otherwise); offline it keeps the old one.
 - `sdr play` starts the tunnel on `127.0.0.1:34200`, starts Factorio as usual, and exits when Factorio exits.
 - In Factorio: Multiplayer -> Connect to address -> `127.0.0.1:34200`. After a disconnect, connect to the same address again.
+  If the server has a game password, Factorio asks for it (`--connect` cannot pass one: the join is refused with `PasswordMissing`).
   If port 34200 is busy, a free port is used: see `sdr.log`.
 - Files added to the Factorio folder: `sdr.exe` and `sdr.log` (overwritten each run). It uses Factorio's own
   `steam_api64.dll` and never writes `steam_appid.txt`.
@@ -49,6 +53,24 @@ Anonymous logon gets a new SteamID every run. For a fixed one, use a Game Server
 
 One token per running server. The token is tied to the Steam account that created it: keep it secret (`gslt*.txt` is git-ignored).
 
+### Autostart (Windows scheduled task)
+
+`run-host.ps1` next to `sdr.exe` restarts the host 5 s after any exit or crash:
+
+    Set-Location $PSScriptRoot
+    while ($true) { & "$PSScriptRoot\sdr.exe" host --target 127.0.0.1:34197; Start-Sleep 5 }
+
+Task `sdr-host`: at startup, as SYSTEM, no time limit, ignore new instances, restart on failure every 1 min:
+
+    $d = 'D:\SERVERS\sdr-tunnel'
+    $a = New-ScheduledTaskAction -Execute (Get-Command pwsh).Source -WorkingDirectory $d -Argument "-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$d\run-host.ps1`""
+    $s = New-ScheduledTaskSettingsSet -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit 0 -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew -StartWhenAvailable
+    Register-ScheduledTask sdr-host -Action $a -Trigger (New-ScheduledTaskTrigger -AtStartup) -Settings $s -Principal (New-ScheduledTaskPrincipal -UserId SYSTEM -LogonType ServiceAccount -RunLevel Highest)
+    Start-ScheduledTask sdr-host
+
+Restart / update: `Stop-ScheduledTask sdr-host` (stops the loop and `sdr.exe`), swap `sdr.exe`, `Start-ScheduledTask sdr-host`.
+Undo: `Stop-ScheduledTask sdr-host; Unregister-ScheduledTask sdr-host -Confirm:$false`.
+
 ## Client (manual, Steam client running and logged in)
 
     sdr client [--appid 427520] --host <SteamID64 from host> [--listen 127.0.0.1:34200]
@@ -58,7 +80,11 @@ Then in Factorio: Multiplayer -> Connect to address -> `127.0.0.1:34200`.
 ## Network tuning (all roles)
 
 - `--send-rate-min 1000000 --send-rate-max 10000000` (bytes/s): Steam's default is 256 KB/s, which makes map downloads crawl.
-  Steam currently sends at the min value, so raise `--send-rate-min` on both ends for faster downloads.
+  Steam sends at the min value and does not adapt. Keep `--send-rate-min` at or just below what the path
+  carries: above it the excess is lost and goodput collapses. Measured 2026-11-11 Georgia <- St. Petersburg
+  (relay vie/sto, ping 94 ms), 12 s UDP blasts: min 0.5 MB/s -> 0.48 MB/s clean; 1 MB/s -> 0.75-0.96 MB/s;
+  1.3 MB/s -> 1.2 MB/s once; 2 MB/s -> 0.7 MB/s (quality 0.65); 4 MB/s -> 0.28 MB/s (quality 0.3).
+  So the default 1 MB/s stays.
 - `--ice all|private|public|off` (default `all`): allow direct P2P (ICE) besides relays. The log shows `ROUTE ... RELAYED|DIRECT`.
 
 ## Logs
