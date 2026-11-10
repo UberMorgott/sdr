@@ -3,8 +3,8 @@
 version = 4
 
 [[package]]
-name = "sdr-tunnel"
-version = "0.1.0"
+name = "sdr"
+version = "0.2.0"
 dependencies = [
  "windows-sys",
 ]

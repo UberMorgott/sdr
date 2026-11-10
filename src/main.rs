@@ -164,8 +164,37 @@ struct IpAddr {
     typ: i32,
 }
 
+/// SteamNetConnectionRealTimeStatus_t, 120 bytes.
+#[repr(C)]
+struct RtStatus {
+    state: i32,
+    ping: i32,
+    quality_local: f32,
+    quality_remote: f32,
+    out_pps: f32,
+    out_bps: f32,
+    in_pps: f32,
+    in_bps: f32,
+    send_rate: i32,
+    pending_unreliable: i32,
+    pending_reliable: i32,
+    sent_unacked_reliable: i32,
+    usec_queue: i64,
+    usec_max_jitter: i32,
+    reserved: [u32; 15],
+}
+
+// ESteamNetworkingConfigValue / Scope / DataType (steamnetworkingtypes.h).
+const CFG_SEND_RATE_MIN: i32 = 10;
+const CFG_SEND_RATE_MAX: i32 = 11;
+const CFG_SCOPE_GLOBAL: i32 = 1;
+const CFG_ICE_ENABLE: i32 = 104; // P2P_Transport_ICE_Enable; values k_nSteamNetworkingConfig_P2P_Transport_ICE_Enable_*
+
 const _: () = {
     use std::mem::{offset_of, size_of};
+    assert!(offset_of!(RtStatus, send_rate) == 32);
+    assert!(offset_of!(RtStatus, usec_queue) == 48);
+    assert!(size_of::<RtStatus>() == 120);
     assert!(size_of::<Identity>() == 136);
     assert!(offset_of!(Msg, peer) == 16);
     assert!(offset_of!(Msg, channel) == 192);
@@ -239,8 +268,13 @@ struct Api {
     recv: unsafe extern "C" fn(P, i32, *mut *mut Msg, i32) -> i32,
     accept: unsafe extern "C" fn(P, *const Identity) -> u8,
     close: unsafe extern "C" fn(P, *const Identity) -> u8,
-    conn_info: unsafe extern "C" fn(P, *const Identity, *mut ConnInfo, *mut c_void) -> i32,
+    conn_info: unsafe extern "C" fn(P, *const Identity, *mut ConnInfo, *mut RtStatus) -> i32,
     release: unsafe extern "C" fn(*mut Msg),
+    set_cfg_i32: unsafe extern "C" fn(P, i32, i32) -> u8,
+    get_cfg: unsafe extern "C" fn(P, i32, i32, isize, *mut i32, *mut c_void, *mut usize) -> i32,
+    pop_count: unsafe extern "C" fn(P) -> i32,
+    pop_list: unsafe extern "C" fn(P, *mut u32, i32) -> i32,
+    ping_dc: unsafe extern "C" fn(P, u32, *mut u32) -> i32,
 }
 
 /// GetProcAddress by name into fn-pointer type F.
@@ -257,8 +291,8 @@ unsafe fn sym<F: Copy>(m: windows_sys::Win32::Foundation::HMODULE, name: &str) -
     }
 }
 
-fn load_api() -> Result<Api, String> {
-    let path = exe_dir().join("steam_api64.dll");
+fn load_api(dir: &std::path::Path) -> Result<Api, String> {
+    let path = dir.join("steam_api64.dll");
     let w: Vec<u16> = path.as_os_str().to_string_lossy().encode_utf16().chain([0]).collect();
     // SAFETY: w NUL-terminated.
     let m = unsafe { LoadLibraryW(w.as_ptr()) };
@@ -281,7 +315,11 @@ fn load_api() -> Result<Api, String> {
         gs_shutdown: s!("SteamGameServer_Shutdown"),
         gs: s!("SteamAPI_SteamGameServer_v015"),
         gs_msgs: s!("SteamAPI_SteamGameServerNetworkingMessages_SteamAPI_v002"),
-        gs_sockets: s!("SteamAPI_SteamGameServerNetworkingSockets_SteamAPI_v012"),
+        // Factorio's steam_api64.dll has only v013; the two methods used here are the same in both.
+        gs_sockets: unsafe {
+            sym(m, "SteamAPI_SteamGameServerNetworkingSockets_SteamAPI_v012")
+                .or_else(|_| sym(m, "SteamAPI_SteamGameServerNetworkingSockets_SteamAPI_v013"))?
+        },
         gs_set_product: s!("SteamAPI_ISteamGameServer_SetProduct"),
         gs_set_moddir: s!("SteamAPI_ISteamGameServer_SetModDir"),
         gs_set_dedicated: s!("SteamAPI_ISteamGameServer_SetDedicatedServer"),
@@ -299,7 +337,10 @@ fn load_api() -> Result<Api, String> {
         user_logged_on: s!("SteamAPI_ISteamUser_BLoggedOn"),
         user_steamid: s!("SteamAPI_ISteamUser_GetSteamID"),
         msgs: s!("SteamAPI_SteamNetworkingMessages_SteamAPI_v002"),
-        sockets: s!("SteamAPI_SteamNetworkingSockets_SteamAPI_v012"),
+        sockets: unsafe {
+            sym(m, "SteamAPI_SteamNetworkingSockets_SteamAPI_v012")
+                .or_else(|_| sym(m, "SteamAPI_SteamNetworkingSockets_SteamAPI_v013"))?
+        },
         utils: s!("SteamAPI_SteamNetworkingUtils_SteamAPI_v004"),
         init_relay: s!("SteamAPI_ISteamNetworkingUtils_InitRelayNetworkAccess"),
         relay_status: s!("SteamAPI_ISteamNetworkingUtils_GetRelayNetworkStatus"),
@@ -315,6 +356,11 @@ fn load_api() -> Result<Api, String> {
         close: s!("SteamAPI_ISteamNetworkingMessages_CloseSessionWithUser"),
         conn_info: s!("SteamAPI_ISteamNetworkingMessages_GetSessionConnectionInfo"),
         release: s!("SteamAPI_SteamNetworkingMessage_t_Release"),
+        set_cfg_i32: s!("SteamAPI_ISteamNetworkingUtils_SetGlobalConfigValueInt32"),
+        get_cfg: s!("SteamAPI_ISteamNetworkingUtils_GetConfigValue"),
+        pop_count: s!("SteamAPI_ISteamNetworkingUtils_GetPOPCount"),
+        pop_list: s!("SteamAPI_ISteamNetworkingUtils_GetPOPList"),
+        ping_dc: s!("SteamAPI_ISteamNetworkingUtils_GetPingToDataCenter"),
     })
 }
 
@@ -399,6 +445,11 @@ fn steamid_valid(id: u64) -> bool {
     (id >> 52) & 0xf != 0 && id >> 56 != 0 && id & 0xffff_ffff != 0
 }
 
+/// SteamNetworkingPOPID -> code, as GetSteamNetworkingLocationPOPStringFromID.
+fn pop_code(id: u32) -> String {
+    [id >> 16, id >> 8, id, id >> 24].iter().map(|&b| b as u8).filter(|&b| b != 0).map(char::from).collect()
+}
+
 fn relay_desc(r: &RelayStatus) -> String {
     format!(
         "avail={} ({}) pingMeasurementInProgress={} networkConfig={} ({}) anyRelay={} ({}) debug='{}'",
@@ -415,18 +466,26 @@ fn relay_desc(r: &RelayStatus) -> String {
 
 fn conn_desc(i: &ConnInfo) -> String {
     format!(
-        "peer={} state={} ({}) endReason={} ({}) endDebug='{}' popRemote=0x{:x} popRelay=0x{:x} flags=0x{:x} desc='{}'",
+        "peer={} state={} ({}) endReason={} ({}) endDebug='{}' popRemote={} popRelay={} flags=0x{:x} [{}] desc='{}'",
         i.peer.steam_id,
         i.state,
         state_name(i.state),
         i.end_reason,
         names::end_reason(i.end_reason),
         cbuf(&i.end_debug),
-        i.pop_remote,
-        i.pop_relay,
+        pop_code(i.pop_remote),
+        pop_code(i.pop_relay),
         i.flags,
+        flags_desc(i.flags),
         cbuf(&i.description)
     )
+}
+
+/// k_nSteamNetworkConnectionInfoFlags_* (steamnetworkingtypes.h).
+fn flags_desc(f: i32) -> String {
+    const N: [&str; 6] = ["Unauthenticated", "Unencrypted", "LoopbackBuffers", "Fast", "Relayed", "DualWifi"];
+    let v: Vec<&str> = N.iter().enumerate().filter(|(b, _)| f & (1 << b) != 0).map(|(_, n)| *n).collect();
+    if f & 16 == 0 { format!("{} direct", v.join(",")) } else { v.join(",") }
 }
 
 unsafe extern "C" fn steam_debug(typ: i32, msg: *const c_char) {
@@ -450,9 +509,81 @@ unsafe extern "C" fn steam_debug(typ: i32, msg: *const c_char) {
     log!("steamnet[{t}] {}", s.trim_end());
 }
 
-unsafe extern "system" fn on_ctrl(_t: u32) -> BOOL {
+static DONE: AtomicBool = AtomicBool::new(false);
+
+unsafe extern "system" fn on_ctrl(t: u32) -> BOOL {
     STOP.store(true, Ordering::SeqCst);
+    // CTRL_CLOSE_EVENT (console window closed): the process dies when this returns, so give run() time to shut Steam down.
+    if t == 2 {
+        for _ in 0..80 {
+            if DONE.load(Ordering::SeqCst) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
     1
+}
+
+/// play mode: the game command, launched at once (or, with --connect, once the client tunnel is READY / after 20 s).
+struct Play {
+    cmd: Vec<String>,
+    /// Steam env as we got it, restored for the game (we overwrite it for our own SteamAPI init).
+    env: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    start: Instant,
+    /// --connect: wait for READY so the game's --mp-connect finds a working tunnel.
+    wait: bool,
+    child: Option<std::process::Child>,
+    code: Option<i32>,
+}
+
+impl Play {
+    /// true = stop the tunnel (game exited or could not start).
+    fn poll(&mut self, ready: bool) -> bool {
+        let r = match &mut self.child {
+            None => {
+                if self.wait && !ready && self.start.elapsed() < Duration::from_secs(20) {
+                    return false;
+                }
+                if self.wait && !ready {
+                    log!("WARNING: tunnel not READY after 20 s; launching the game anyway");
+                }
+                let mut c = std::process::Command::new(&self.cmd[0]);
+                c.args(&self.cmd[1..]);
+                for (k, v) in &self.env {
+                    match v {
+                        Some(v) => c.env(k, v),
+                        None => c.env_remove(k),
+                    };
+                }
+                log!("spawning game: {:?}", self.cmd);
+                match c.spawn() {
+                    Ok(ch) => {
+                        log!("game pid {}", ch.id());
+                        self.child = Some(ch);
+                        return false;
+                    }
+                    Err(e) => Err(format!("spawn failed: {e}")),
+                }
+            }
+            Some(ch) => match ch.try_wait() {
+                Ok(None) => return false,
+                Ok(Some(s)) => Ok(s),
+                Err(e) => Err(format!("wait failed: {e}")),
+            },
+        };
+        match r {
+            Ok(s) => {
+                log!("game exited: {s}");
+                self.code = Some(s.code().unwrap_or(1));
+            }
+            Err(e) => {
+                log!("FATAL: game {e}");
+                self.code = Some(1);
+            }
+        }
+        true
+    }
 }
 
 // ------------------------------------------------------------------ tunnel state
@@ -494,6 +625,9 @@ struct Ctx {
     utils: P,
     ready: bool,
     role: Role,
+    play: Option<Play>,
+    /// last logged (Relayed flag, relay POP) per session, to log route changes.
+    routes: std::cell::RefCell<HashMap<u64, (i32, u32)>>,
 }
 
 impl Ctx {
@@ -731,8 +865,9 @@ impl Ctx {
         for (id, c) in list {
             let ident = Identity::steam(id);
             let mut info: ConnInfo = zeroed();
-            // SAFETY: msgs live; info writable; quick status may be null.
-            let s = unsafe { (self.api.conn_info)(self.msgs, &ident, &mut info, std::ptr::null_mut()) };
+            let mut rt: RtStatus = zeroed();
+            // SAFETY: msgs live; info and rt writable.
+            let s = unsafe { (self.api.conn_info)(self.msgs, &ident, &mut info, &mut rt) };
             log!(
                 "SESSION {id}: GetSessionConnectionInfo={s} ({}) {} | rx {} pkts/{} B, tx {} pkts/{} B",
                 state_name(s),
@@ -742,7 +877,55 @@ impl Ctx {
                 c.tx_pkts,
                 c.tx_bytes
             );
+            let route = (info.flags & 16, info.pop_relay);
+            if s == 3 && self.routes.borrow_mut().insert(id, route) != Some(route) {
+                log!(
+                    "ROUTE {id}: {} relayPOP={} remotePOP={} addr/desc='{}'",
+                    if route.0 != 0 { "RELAYED" } else { "DIRECT" },
+                    pop_code(info.pop_relay),
+                    pop_code(info.pop_remote),
+                    cbuf(&info.description)
+                );
+            }
+            log!(
+                "RT {id}: ping={} ms quality local={:.3} remote={:.3} out={:.0} pkt/s {:.0} B/s in={:.0} pkt/s {:.0} B/s sendRate={} B/s pendingUnrel={} B pendingRel={} B queue={} us jitterMax={} us",
+                rt.ping,
+                rt.quality_local,
+                rt.quality_remote,
+                rt.out_pps,
+                rt.out_bps,
+                rt.in_pps,
+                rt.in_bps,
+                rt.send_rate,
+                rt.pending_unreliable,
+                rt.pending_reliable,
+                rt.usec_queue,
+                rt.usec_max_jitter
+            );
         }
+    }
+
+    /// Top 10 relay POPs by ping (GetPingToDataCenter: best route, maybe via another POP).
+    fn pop_pings(&self) {
+        // SAFETY (whole fn): utils live; list sized to the count we pass.
+        let n = unsafe { (self.api.pop_count)(self.utils) }.max(0);
+        let mut ids = vec![0u32; n as usize];
+        let got = unsafe { (self.api.pop_list)(self.utils, ids.as_mut_ptr(), n) }.clamp(0, n) as usize;
+        let mut pings: Vec<(i32, u32, u32)> = ids[..got]
+            .iter()
+            .map(|&id| {
+                let mut via = 0u32;
+                (unsafe { (self.api.ping_dc)(self.utils, id, &mut via) }, id, via)
+            })
+            .filter(|p| p.0 >= 0)
+            .collect();
+        pings.sort();
+        let top: Vec<String> = pings
+            .iter()
+            .take(10)
+            .map(|&(ms, id, via)| if via == 0 || via == id { format!("{} {ms}ms", pop_code(id)) } else { format!("{} {ms}ms via {}", pop_code(id), pop_code(via)) })
+            .collect();
+        log!("POPs: {got} listed, {} with ping; best: {}", pings.len(), top.join(", "));
     }
 
     fn diag(&mut self) {
@@ -790,6 +973,7 @@ impl Ctx {
         let ready = logged != 0 && steamid_valid(sid) && relay == 100;
         if ready && !self.ready {
             log!("READY steamid={sid} relay=Current auth={} id={}", avail_name(auth), steamid_desc(sid));
+            self.pop_pings();
         } else if !ready && self.ready {
             log!("NOT READY any more (logged={logged} steamid={sid} relay={})", avail_name(relay));
         }
@@ -799,7 +983,7 @@ impl Ctx {
     fn run(&mut self) {
         let start = Instant::now();
         let mut next_diag = Instant::now();
-        let mut next_sess = Instant::now() + Duration::from_secs(10);
+        let mut next_sess = Instant::now() + Duration::from_secs(5);
         while !STOP.load(Ordering::SeqCst) {
             let mut busy = self.pump_callbacks();
             busy |= self.pump_sdr();
@@ -809,18 +993,24 @@ impl Ctx {
                 log!("--- diag t+{:.1} s", start.elapsed().as_secs_f32());
                 self.diag();
                 next_diag = now + Duration::from_secs(if self.ready { 30 } else { 2 });
-                next_sess = now + Duration::from_secs(10);
+                next_sess = now + Duration::from_secs(5);
             } else if now >= next_sess {
                 self.sessions_diag();
-                next_sess = now + Duration::from_secs(10);
+                next_sess = now + Duration::from_secs(5);
             }
             self.reap_idle();
+            if let Some(p) = &mut self.play {
+                if p.poll(self.ready) {
+                    STOP.store(true, Ordering::SeqCst);
+                }
+            }
             if !busy {
                 std::thread::sleep(Duration::from_millis(1));
             }
         }
-        log!("stop requested (Ctrl-C)");
+        log!("stop requested");
         unsafe {
+            (self.api.set_debug)(self.utils, 0, None);
             if self.is_host {
                 (self.api.gs_logoff)(self.gs);
                 log!("LogOff called");
@@ -835,6 +1025,7 @@ impl Ctx {
                 log!("SteamAPI_Shutdown called");
             }
         }
+        DONE.store(true, Ordering::SeqCst);
     }
 }
 
@@ -844,11 +1035,27 @@ fn opt(args: &[String], name: &str) -> Option<String> {
     args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned()
 }
 
-const USAGE: &str = "usage:\n  sdr-tunnel host   [--appid 480] [--target 127.0.0.1:34197] [--game-port 27016] [--mode 2] [--idle 60] [--debug-level 5] [--gslt-file <path>]\n  sdr-tunnel client [--appid 480] --host <SteamID64> [--listen 127.0.0.1:34200] [--debug-level 5]\n\
+const DEFAULT_APPID: u64 = 427520; // Factorio: SDR works with it (tested), Steam shows the right game
+
+const USAGE: &str = "usage:\n  sdr host   [--appid 427520] [--target 127.0.0.1:34197] [--game-port 27016] [--mode 2] [--idle 60] [--debug-level 5] [--gslt-file <path>]\n  sdr client [--appid 427520] --host <SteamID64> [--listen 127.0.0.1:34200] [--debug-level 5]\n  sdr play   [--appid 427520] --host <SteamID64> [--port 34200] [--connect] [--debug-level 5] -- <game exe> [game args...]\n\
+     play: client tunnel on 127.0.0.1:<port> (busy -> a free port, logged), runs the game, exits with the game's exit code;\n\
+           --connect appends --mp-connect 127.0.0.1:<port> to the game command; log sdr.log next to the exe (overwritten)\n\
+     all roles: [--send-rate-min 1000000] [--send-rate-max 10000000] (bytes/s, Steam default 256 KB/s) [--ice all|private|public|off]\n\
      --mode: EServerMode 1=NoAuthentication 2=Authentication 3=AuthenticationAndSecure\n\
      --debug-level: Steam networking debug output 0=None 2=Error 4=Warning 5=Msg 6=Verbose 7=Debug 8=Everything\n\
      --gslt-file: Game Server Login Token file (default: gslt.txt next to the exe if present; env SDR_GSLT also works);\n\
                   without a token the host logs on anonymously (new SteamID every run)";
+
+/// Tunnel setup failed: exit 1, but in play mode still run the game (and wait for it) first.
+fn die(play: &mut Option<Play>) -> ! {
+    let Some(p) = play else { std::process::exit(1) };
+    log!("tunnel unavailable; launching the game without it");
+    p.wait = false;
+    while !p.poll(false) {
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    std::process::exit(p.code.unwrap_or(1))
+}
 
 fn usage() -> ! {
     eprintln!("{USAGE}");
@@ -881,40 +1088,61 @@ fn mask(tok: &str) -> String {
 }
 
 fn main() {
-    let args: Vec<String> = std::env::args().collect();
+    let all: Vec<String> = std::env::args().collect();
+    // Our options end at "--"; the rest is the game command (play).
+    let split = all.iter().position(|a| a == "--").unwrap_or(all.len());
+    let args = &all[..split];
+    let mut game: Vec<String> = all.get(split + 1..).unwrap_or_default().to_vec();
     if args.iter().skip(1).any(|a| a == "-h" || a == "--help" || a == "help") {
         println!("{USAGE}");
         return;
     }
     let role = args.get(1).map(String::as_str).unwrap_or("");
-    let is_host = match role {
-        "host" => true,
-        "client" => false,
+    let (is_host, is_play) = match role {
+        "host" => (true, false),
+        "client" => (false, false),
+        "play" if !game.is_empty() => (false, true),
         _ => usage(),
     };
     let num = |name: &str, def: u64| -> u64 {
-        opt(&args, name).map_or(def, |v| v.parse().unwrap_or_else(|_| usage()))
+        opt(args, name).map_or(def, |v| v.parse().unwrap_or_else(|_| usage()))
     };
-    let appid = num("--appid", 480);
+    let appid = num("--appid", DEFAULT_APPID);
     let debug_level = num("--debug-level", 5) as i32;
+    let rate_min = num("--send-rate-min", 1_000_000).min(i32::MAX as u64) as i32;
+    let rate_max = num("--send-rate-max", 10_000_000).min(i32::MAX as u64) as i32;
+    let ice = match opt(args, "--ice").as_deref().unwrap_or("all") {
+        "all" => 0x7fff_ffff,
+        "private" => 2,
+        "public" => 4,
+        "off" => 0,
+        _ => usage(),
+    };
 
-    let log_path = exe_dir().join(format!("sdr-tunnel-{role}.log"));
-    match OpenOptions::new().create(true).append(true).open(&log_path) {
+    // play: one log, overwritten per run (it lives in the game folder).
+    let log_path = exe_dir().join(if is_play { "sdr.log".to_string() } else { format!("sdr-{role}.log") });
+    match OpenOptions::new().create(true).write(true).append(!is_play).truncate(is_play).open(&log_path) {
         Ok(f) => *LOG.lock().unwrap() = Some(f),
         Err(e) => eprintln!("cannot open {}: {e}; logging to stdout only", log_path.display()),
     }
-    log!("==== sdr-tunnel {} {role} start, args {:?}, log {}", env!("CARGO_PKG_VERSION"), &args[1..], log_path.display());
-    // SAFETY: handler only stores an atomic.
+    log!("==== sdr {} {role} start, args {:?}, log {}", env!("CARGO_PKG_VERSION"), &all[1..], log_path.display());
+    // SAFETY: handler only touches atomics and sleeps.
     let ok = unsafe { SetConsoleCtrlHandler(Some(on_ctrl), 1) };
     log!("SetConsoleCtrlHandler = {ok}");
 
+    let steam_env: Vec<(&'static str, Option<std::ffi::OsString>)> =
+        ["SteamAppId", "SteamGameId"].into_iter().map(|k| (k, std::env::var_os(k))).collect();
+    log!("env before: {steam_env:?}");
     std::env::set_var("SteamAppId", appid.to_string());
     std::env::set_var("SteamGameId", appid.to_string());
     log!("env SteamAppId=SteamGameId={appid}");
-    let appid_file = exe_dir().join("steam_appid.txt");
-    match std::fs::write(&appid_file, appid.to_string()) {
-        Ok(()) => log!("wrote {} = {appid}", appid_file.display()),
-        Err(e) => log!("cannot write {}: {e}", appid_file.display()),
+    // play runs in the game folder: never touch its steam_appid.txt, env is enough there.
+    if !is_play {
+        let appid_file = exe_dir().join("steam_appid.txt");
+        match std::fs::write(&appid_file, appid.to_string()) {
+            Ok(()) => log!("wrote {} = {appid}", appid_file.display()),
+            Err(e) => log!("cannot write {}: {e}", appid_file.display()),
+        }
     }
 
     let token = if is_host {
@@ -935,11 +1163,26 @@ fn main() {
         None
     };
 
-    let api = match load_api() {
+    // play: the game's own steam_api64.dll (next to the game exe); else ours next to sdr.exe.
+    let game_dll_dir = game.first().and_then(|g| std::path::Path::new(g).parent().map(PathBuf::from));
+    let dll_dir = match game_dll_dir {
+        Some(d) if is_play && d.join("steam_api64.dll").is_file() => d,
+        _ => exe_dir(),
+    };
+    let connect = args.iter().any(|a| a == "--connect");
+    let mut play = is_play.then(|| Play {
+        cmd: std::mem::take(&mut game),
+        env: steam_env,
+        start: Instant::now(),
+        wait: connect,
+        child: None,
+        code: None,
+    });
+    let api = match load_api(&dll_dir) {
         Ok(a) => a,
         Err(e) => {
             log!("FATAL: {e}");
-            std::process::exit(1);
+            die(&mut play);
         }
     };
     let mut err: ErrMsg = [0; 1024];
@@ -981,15 +1224,19 @@ fn main() {
         log!("SteamGameServer_GetHSteamPipe = {pipe}; ISteamGameServer={gs:p} ISteamNetworkingMessages(gs)={msgs:p} ISteamNetworkingSockets(gs)={sockets:p}");
         role_state = Role::Host { target, idle: Duration::from_secs(num("--idle", 60)), peers: HashMap::new() };
     } else {
-        let host: u64 = opt(&args, "--host").and_then(|v| v.parse().ok()).unwrap_or_else(|| usage());
-        let listen = opt(&args, "--listen").unwrap_or_else(|| "127.0.0.1:34200".into());
+        let host: u64 = opt(args, "--host").and_then(|v| v.parse().ok()).unwrap_or_else(|| usage());
+        let listen = if is_play {
+            format!("127.0.0.1:{}", num("--port", 34200))
+        } else {
+            opt(args, "--listen").unwrap_or_else(|| "127.0.0.1:34200".into())
+        };
         log!("host = {}", steamid_desc(host));
         log!("SteamAPI_InitFlat ...");
         // SAFETY: err writable.
         let r = unsafe { (api.api_init)(&mut err) };
         log!("SteamAPI_InitFlat = {r} ({}) errMsg='{}'", init_result_name(r), cbuf(&err));
         if r != 0 {
-            std::process::exit(1);
+            die(&mut play);
         }
         unsafe {
             pipe = (api.api_pipe)();
@@ -999,14 +1246,25 @@ fn main() {
         }
         gs = std::ptr::null_mut();
         log!("SteamAPI_GetHSteamPipe = {pipe}; ISteamUser={user:p} ISteamNetworkingMessages={msgs:p} ISteamNetworkingSockets={sockets:p}");
-        let sock = match UdpSocket::bind(&listen).and_then(|s| s.set_nonblocking(true).map(|()| s)) {
+        let bound = UdpSocket::bind(&listen).or_else(|e| {
+            if !is_play {
+                return Err(e);
+            }
+            log!("bind {listen}: {e}; play falls back to a free port");
+            UdpSocket::bind("127.0.0.1:0")
+        });
+        let sock = match bound.and_then(|s| s.set_nonblocking(true).map(|()| s)) {
             Ok(s) => s,
             Err(e) => {
                 log!("FATAL: bind {listen}: {e}");
-                std::process::exit(1);
+                die(&mut play);
             }
         };
-        log!("listening for local UDP on {listen}");
+        let local = sock.local_addr().map(|a| a.to_string()).unwrap_or(listen);
+        log!("listening for local UDP on {local}");
+        if let (Some(p), true) = (&mut play, connect) {
+            p.cmd.extend(["--mp-connect".to_string(), local]);
+        }
         role_state = Role::Client { host, sock, local: None, c: Counters::new() };
     }
     // steam_api.h: "must be called after SteamAPI_Init" (before it, no callback is ever delivered).
@@ -1018,7 +1276,7 @@ fn main() {
     log!("ISteamNetworkingUtils = {utils:p}");
     if msgs.is_null() || sockets.is_null() || utils.is_null() || (is_host && gs.is_null()) || (!is_host && user.is_null()) {
         log!("FATAL: a required interface is null");
-        std::process::exit(1);
+        die(&mut play);
     }
     unsafe {
         (api.set_debug)(utils, debug_level, Some(steam_debug));
@@ -1030,6 +1288,17 @@ fn main() {
             log!("SetModDir(\"sdr-tunnel\") done");
             (api.gs_set_dedicated)(gs, 1);
             log!("SetDedicatedServer(true) done");
+        }
+        // SDK default send rate is 256 KB/s (map downloads crawl): raise it before any session exists.
+        for (name, cfg, v) in [
+            ("SendRateMin", CFG_SEND_RATE_MIN, rate_min),
+            ("SendRateMax", CFG_SEND_RATE_MAX, rate_max),
+            ("P2P_Transport_ICE_Enable", CFG_ICE_ENABLE, ice),
+        ] {
+            let ok = (api.set_cfg_i32)(utils, cfg, v);
+            let (mut typ, mut val, mut cb) = (0i32, 0i32, std::mem::size_of::<i32>());
+            let r = (api.get_cfg)(utils, cfg, CFG_SCOPE_GLOBAL, 0, &mut typ, (&mut val as *mut i32).cast(), &mut cb);
+            log!("SetGlobalConfigValueInt32({name}={cfg}, {v}) = {ok}; GetConfigValue = {r}, type {typ}, value {val}");
         }
         (api.init_relay)(utils);
         log!("InitRelayNetworkAccess done");
@@ -1047,8 +1316,11 @@ fn main() {
             None => {}
         }
     }
-    let mut ctx = Ctx { api, pipe, is_host, gs, user, msgs, sockets, utils, ready: false, role: role_state };
+    let mut ctx = Ctx { api, pipe, is_host, gs, user, msgs, sockets, utils, ready: false, role: role_state, play, routes: Default::default() };
     ctx.run();
+    let code = ctx.play.and_then(|p| p.code).unwrap_or(0);
+    log!("exit {code}");
+    std::process::exit(code);
 }
 
 #[cfg(test)]
@@ -1063,6 +1335,13 @@ mod tests {
         assert!(steamid_desc(id).contains("type=AnonGameServer universe=Public account=12345"));
         assert!(id.to_string().starts_with("9007"));
         assert!(!steamid_valid(0));
+    }
+
+    #[test]
+    fn pop_and_flags() {
+        assert_eq!(pop_code(((b'v' as u32) << 16) | ((b'i' as u32) << 8) | b'e' as u32), "vie");
+        assert_eq!(flags_desc(16 | 1), "Unauthenticated,Relayed");
+        assert_eq!(flags_desc(8), "Fast direct");
     }
 
     #[test]

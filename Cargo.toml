@@ -1,6 +1,6 @@
 [package]
-name = "sdr-tunnel"
-version = "0.1.0"
+name = "sdr"
+version = "0.2.0"
 edition = "2021"
 description = "UDP <-> Steam Datagram Relay tunnel (anonymous game server host / Steam client) with verbose Steam logging"
 

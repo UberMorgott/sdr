@@ -3,3 +3,4 @@
 *.log
 steam_appid.txt
 gslt.txt
+*.etag
