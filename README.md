@@ -13,7 +13,9 @@ Start Factorio with Steam's Play button: started outside Steam, Factorio quits a
 
 What it does:
 - `curl -z` downloads `sdr.exe` into the Factorio folder only when the release is newer (HTTP 304 otherwise); offline it keeps the old one.
-- `sdr play` starts the tunnel on `127.0.0.1:34200`, starts Factorio as usual, and exits when Factorio exits.
+- `sdr play` starts the tunnel on `127.0.0.1:34200`, starts Factorio as usual, and exits when Factorio exits, with
+  Factorio's exit code. Factorio restarts itself after mod sync / settings changes: `sdr` then follows any process with
+  the same exe path and exits 5 s after the last one is gone.
 - In Factorio: Multiplayer -> Connect to address -> `127.0.0.1:34200`. After a disconnect, connect to the same address again.
   If the server has a game password, Factorio asks for it (`--connect` cannot pass one: the join is refused with `PasswordMissing`).
   If port 34200 is busy, a free port is used: see `sdr.log`.
@@ -80,8 +82,9 @@ Then in Factorio: Multiplayer -> Connect to address -> `127.0.0.1:34200`.
 
 ## Network tuning (all roles)
 
-- `--send-rate-min 1000000 --send-rate-max 10000000` (bytes/s): Steam's default is 256 KB/s, which makes map downloads crawl.
-  Steam sends at the min value and does not adapt. Keep `--send-rate-min` at or just below what the path
+- `--send-rate 1000000` (bytes/s): sets Steam's SendRateMin = SendRateMax (Steam's default is 256 KB/s, which makes
+  map downloads crawl). Steam does no bandwidth probing: it sends at the min value, so one fixed rate is set
+  (`--send-rate-min` / `--send-rate-max` still override one side). Keep it at or just below what the path
   carries: above it the excess is lost and goodput collapses. Measured 2026-11-11 Georgia <- St. Petersburg
   (relay vie/sto, ping 94 ms), 12 s UDP blasts: min 0.5 MB/s -> 0.48 MB/s clean; 1 MB/s -> 0.75-0.96 MB/s;
   1.3 MB/s -> 1.2 MB/s once; 2 MB/s -> 0.7 MB/s (quality 0.65); 4 MB/s -> 0.28 MB/s (quality 0.3).
@@ -89,9 +92,19 @@ Then in Factorio: Multiplayer -> Connect to address -> `127.0.0.1:34200`.
   1 MB/s 0-3.1 % (quality 0.96-1.0); 1.2 MB/s 0, 0, 6.8 %; 1.3 MB/s 0-15 %; 1.5 MB/s 46-51 % (quality 0.7);
   2 MB/s 70-76 % (quality 0.5). The path itself caps near 1.2 MB/s and has bad minutes (~25 % loss at any rate),
   so the bigger buffers do not move the cliff: the default 1 MB/s stays.
-- `--send-buffer 4194304` (bytes): Steam's per-session SendBufferSize (default 512 KB). When it is full,
+  v0.4.0 checks (2026-11-11, 1200 B, 5 s warmup + 20 s, 3 rounds): a real map download (5.0 MB, 469 KB/s) left the
+  host's Steam queue empty at 0.5-0.57 MB/s out, so Factorio's own block transfer, not the tunnel, set the pace.
+  Two host identities in parallel at 0.9 MB/s each gave 1.47 / 1.48 / 1.75 MB/s together (2-19 % loss) vs one at
+  1.8 MB/s: 0.95-1.15 MB/s (36-47 % loss): not a reason for multipath while Factorio is the limit.
+  Forcing the host's relay cluster (`SDRClient_ForceRelayCluster`) to hel/waw/fra was never better than auto (sto, 96 ms):
+  waw +30 ms, fra +18 ms, same loss; so there is no option for it.
+- `--send-buffer <bytes>`: Steam's per-session SendBufferSize (Steam default 512 KB; ours: send rate x 150 ms,
+  min 64 KiB, i.e. 150 KB at 1 MB/s). Queued data is latency: v0.3.0's 4 MiB allowed ~4 s at 1 MB/s. When it is full,
   SendMessage returns `LimitExceeded`; such datagrams wait in a small per-peer retry queue (max 50 ms / 1 MB),
-  then are dropped. The `SESSION` log line counts `LimitExceeded`, the retry queue and drops.
+  then are dropped. The `SESSION` log line counts `LimitExceeded`, the retry queue and drops; `RT` shows
+  Steam's own queue (`pendingUnrel`, `queue` in us).
+- `--dual-wifi`: allow Steam's dual-band Wi-Fi multipath (`DualWifi_Enable`). Off by default: on a Qualcomm
+  dual-band card the second socket failed every send (`WSAENETUNREACH`, 27 retries per session).
 - Local UDP sockets get 4 MiB `SO_RCVBUF`/`SO_SNDBUF` (Windows default 64 KB); the read-back is logged.
 - `--ice all|private|public|off` (default `all`): allow direct P2P (ICE) besides relays. The log shows `ROUTE ... RELAYED|DIRECT`.
 
@@ -102,4 +115,10 @@ logger thread and flushed per line (a full queue drops lines and logs how many):
 every init call and result, every Steam callback by id, Steam networking debug output (`steamnet[...]`), a diag block
 every 2 s until READY, every 30 s after (logon, SteamID, public IP, relay/auth status, ping location), per-session
 state and realtime stats (`RT`: ping, quality, in/out rate, send rate, queue) every 5 s, and the 10 best relay POPs
-at READY. Ctrl-C logs off and shuts Steam down.
+at READY. Steam's text is decoded from the Windows ANSI code page (no mojibake on Russian Windows).
+Ctrl-C or closing the console closes the sessions; the host logs off and shuts the game server down. `client`/`play`
+skip `SteamAPI_Shutdown`: it crashed (0xC0000005) in 2 of 8 local runs and the game's exit code was lost; process
+exit releases Steam anyway. A 5 s watchdog exits with the right code if Steam teardown hangs.
+
+The host drops a peer on session failure (callback 1252), on `ClosedByPeer` / `ProblemDetectedLocally`, or after
+`--idle` seconds without traffic Steam accepted.
