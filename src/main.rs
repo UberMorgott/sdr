@@ -93,12 +93,17 @@ fn log_init(mut file: Option<File>) {
     let _ = LOG.set(tx);
 }
 
-/// Exit after the logger wrote what is queued (max 2 s).
-fn exit(code: i32) -> ! {
+/// Wait until the logger wrote what is queued (max 2 s).
+fn log_flush() {
     let t = Instant::now();
     while LOG_WRITTEN.load(Ordering::SeqCst) < LOG_SENT.load(Ordering::SeqCst) && t.elapsed() < Duration::from_secs(2) {
         std::thread::sleep(Duration::from_millis(5));
     }
+}
+
+/// Exit after the logger wrote what is queued.
+fn exit(code: i32) -> ! {
+    log_flush();
     DONE.store(true, Ordering::SeqCst);
     std::process::exit(code)
 }
@@ -326,7 +331,6 @@ struct Api {
     // client
     api_init: unsafe extern "C" fn(*mut ErrMsg) -> i32,
     api_pipe: unsafe extern "C" fn() -> i32,
-    api_shutdown: unsafe extern "C" fn(),
     user: unsafe extern "C" fn() -> P,
     user_logged_on: unsafe extern "C" fn(P) -> u8,
     user_steamid: unsafe extern "C" fn(P) -> u64,
@@ -410,7 +414,6 @@ fn load_api(dir: &std::path::Path) -> Result<Api, String> {
         gs_public_ip: s!("SteamAPI_ISteamGameServer_GetPublicIP"),
         api_init: s!("SteamAPI_InitFlat"),
         api_pipe: s!("SteamAPI_GetHSteamPipe"),
-        api_shutdown: s!("SteamAPI_Shutdown"),
         user: s!("SteamAPI_SteamUser_v023"),
         user_logged_on: s!("SteamAPI_ISteamUser_BLoggedOn"),
         user_steamid: s!("SteamAPI_ISteamUser_GetSteamID"),
@@ -1142,9 +1145,29 @@ impl Ctx {
                 std::thread::sleep(Duration::from_millis(1));
             }
         }
-        log!("stop requested");
+        let code = self.play.as_ref().and_then(|p| p.code).unwrap_or(0);
+        log!("stop requested (exit code will be {code})");
+        // A play log once ended here (no Shutdown line): never let a stuck Steam shutdown eat the exit code.
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(5));
+            log!("WARNING: Steam shutdown still running after 5 s; exiting {code} without waiting");
+            exit(code);
+        });
+        let ids: Vec<u64> = match &self.role {
+            Role::Host { peers, .. } => peers.keys().copied().collect(),
+            Role::Client { host, .. } => vec![*host],
+        };
+        for id in ids {
+            // SAFETY: msgs live.
+            let ok = unsafe { (self.api.close)(self.msgs, &Identity::steam(id)) };
+            log!("CloseSessionWithUser({id}) = {ok}");
+        }
+        log!("Steam shutdown ...");
+        log_flush(); // if Steam crashes below, the log still shows how far we got
         unsafe {
             (self.api.set_debug)(self.utils, 0, None);
+            log!("SetDebugOutputFunction(None) done");
+            log_flush();
             if self.is_host {
                 (self.api.gs_logoff)(self.gs);
                 log!("LogOff called");
@@ -1155,8 +1178,9 @@ impl Ctx {
                 (self.api.gs_shutdown)();
                 log!("SteamGameServer_Shutdown called");
             } else {
-                (self.api.api_shutdown)();
-                log!("SteamAPI_Shutdown called");
+                // SteamAPI_Shutdown (Factorio's steam_api64.dll) crashed with 0xC0000005 in 2 of 8 local play runs,
+                // losing the game's exit code; process exit releases the Steam pipe anyway.
+                log!("SteamAPI_Shutdown skipped (crashes intermittently inside Steam); exiting");
             }
         }
     }
@@ -1173,7 +1197,7 @@ const DEFAULT_APPID: u64 = 427520; // Factorio; SDR host READY + client echo ver
 const USAGE: &str = "usage:\n  sdr host   [--appid 427520] [--target 127.0.0.1:34197] [--game-port 27016] [--mode 2] [--idle 60] [--debug-level 5] [--gslt-file <path>]\n  sdr client [--appid 427520] --host <SteamID64> [--listen 127.0.0.1:34200] [--debug-level 5]\n  sdr play   [--appid 427520] --host <SteamID64> [--port 34200] [--connect] [--debug-level 5] -- <game exe> [game args...]\n\
      play: client tunnel on 127.0.0.1:<port> (busy -> a free port, logged), runs the game, exits with the game's exit code;\n\
            --connect appends --mp-connect 127.0.0.1:<port> to the game command; log sdr.log next to the exe (overwritten)\n\
-     all roles: [--send-rate-min 1000000] [--send-rate-max 10000000] (bytes/s, Steam default 256 KB/s) [--ice all|private|public|off]\n\
+     all roles: [--send-rate-min 1000000] [--send-rate-max 10000000] (bytes/s, Steam default 256 KB/s) [--ice all|private|public|off] \n\
                 [--send-buffer 4194304] (Steam SendBufferSize bytes, Steam default 512 KB)\n\
      --mode: EServerMode 1=NoAuthentication 2=Authentication 3=AuthenticationAndSecure\n\
      --debug-level: Steam networking debug output 0=None 2=Error 4=Warning 5=Msg 6=Verbose 7=Debug 8=Everything\n\
