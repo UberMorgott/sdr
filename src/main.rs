@@ -1217,7 +1217,8 @@ const DEFAULT_APPID: u64 = 427520; // Factorio; SDR host READY + client echo ver
 const USAGE: &str = "usage:\n  sdr host   [--appid 427520] [--target 127.0.0.1:34197] [--game-port 27016] [--mode 2] [--idle 60] [--debug-level 5] [--gslt-file <path>]\n  sdr client [--appid 427520] --host <SteamID64> [--listen 127.0.0.1:34200] [--debug-level 5]\n  sdr play   [--appid 427520] --host <SteamID64> [--port 34200] [--connect] [--debug-level 5] -- <game exe> [game args...]\n\
      play: client tunnel on 127.0.0.1:<port> (busy -> a free port, logged), runs the game, exits with the game's exit code;\n\
            --connect appends --mp-connect 127.0.0.1:<port> to the game command; log sdr.log next to the exe (overwritten)\n\
-     all roles: [--send-rate-min 1000000] [--send-rate-max 10000000] (bytes/s, Steam default 256 KB/s) [--ice all|private|public|off] [--dual-wifi]\n\
+     all roles: [--send-rate 1000000] (bytes/s, sets SendRateMin = SendRateMax; Steam default 256 KB/s; --send-rate-min/-max override one side)\n\
+                [--ice all|private|public|off] [--dual-wifi]\n\
                 [--send-buffer 4194304] (Steam SendBufferSize bytes, Steam default 512 KB)\n\
      --mode: EServerMode 1=NoAuthentication 2=Authentication 3=AuthenticationAndSecure\n\
      --debug-level: Steam networking debug output 0=None 2=Error 4=Warning 5=Msg 6=Verbose 7=Debug 8=Everything\n\
@@ -1296,8 +1297,10 @@ fn main() {
     };
     let appid = num("--appid", DEFAULT_APPID);
     let debug_level = num("--debug-level", 5) as i32;
-    let rate_min = num("--send-rate-min", 1_000_000).min(i32::MAX as u64) as i32;
-    let rate_max = num("--send-rate-max", 10_000_000).min(i32::MAX as u64) as i32;
+    // Steam does no bandwidth probing (it sends at SendRateMin): one fixed rate, Min == Max; old flags still override.
+    let rate = num("--send-rate", 1_000_000).min(i32::MAX as u64);
+    let rate_min = num("--send-rate-min", rate).min(i32::MAX as u64) as i32;
+    let rate_max = num("--send-rate-max", rate).min(i32::MAX as u64) as i32;
     let send_buffer = num("--send-buffer", 4 << 20).min(i32::MAX as u64) as i32;
     let ice = match opt(args, "--ice").as_deref().unwrap_or("all") {
         "all" => 0x7fff_ffff,
