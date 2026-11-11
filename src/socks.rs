@@ -82,14 +82,28 @@ pub fn ping(api: &Api, sockets: P, h: u32) -> i32 {
 
 // ------------------------------------------------------------------ accel push connections
 
-/// Map-block push connections: host listens on virtual ports 1..=PUSH_CONNS, client connects them after a v2 ack.
-pub const PUSH_CONNS: i32 = 3;
-/// Total push rate to start at (bench 2026-11-11: best N x rate with loss <= 3 % in every round).
-pub const PUSH_BEST: u32 = 2_400_000; // 3 x 800 KB/s: 2.27-2.31 MB/s, loss 0.2-2.1 % in 3 rounds
+/// v2 (v0.6.0 host): client connects virtual ports 1..=PUSH_CONNS_V2 after the download-time ack.
+pub const PUSH_CONNS_V2: i32 = 3;
+/// v3 host listens on 1..=PUSH_LISTEN (acked with HELLO3); a v3 client opens min(that, PUSH_N) at session start.
+pub const PUSH_LISTEN: i32 = 8;
+pub const PUSH_N: usize = 5;
+/// Total push rate to start at, and bounds (bench 2026-11-11, see README).
+pub const PUSH_START: u32 = 3_200_000;
 pub const PUSH_MIN: u32 = 500_000;
-pub const PUSH_MAX: u32 = PUSH_BEST / 5 * 6;
+pub const PUSH_MAX: u32 = 4_500_000;
+/// Per push connection (bench: 1.0 MB/s clean, 1.2 MB/s lossy on one relayed connection).
+pub const PER_CONN_MAX: u32 = 1_000_000;
+/// AIMD: +PUSH_ADD per clean report, x PUSH_DOWN on loss > LOSS_HI or RTT > base + RTT_HI (queue build-up).
+const PUSH_ADD: u32 = 100_000;
+const PUSH_DOWN: f64 = 0.85;
+const LOSS_HI: f64 = 0.05;
+const LOSS_OK: f64 = 0.02;
+const RTT_HI: i32 = 30;
+const RTT_OK: i32 = 15;
 /// Client: connections not up after this are closed; the host keeps pushing over Messages (v0.5.0 behaviour).
 pub const PUSH_CONNECT_WAIT: Duration = Duration::from_secs(3);
+/// Client: a closed / failed push connection is opened again after this.
+pub const PUSH_RECONNECT: Duration = Duration::from_secs(5);
 pub const REPORT_EVERY: Duration = Duration::from_millis(250);
 
 /// Block n goes on connection n % k.
@@ -97,38 +111,60 @@ pub fn stripe(n: u32, k: usize) -> usize {
     n as usize % k.max(1)
 }
 
-/// Host: loss-based total push rate from the client's cumulative received-block reports.
+/// Host: AIMD total push rate from the client's cumulative received-block reports and the push connections' RTT.
 pub struct PushRate {
     pub rate: u32,
     base: Option<(u64, u64)>,
+    /// lowest RTT seen (idle connections measure it before any download)
+    pub rtt0: Option<i32>,
+    /// reports to skip after a decrease (their loss / RTT still stems from the old rate)
+    hold: u8,
+    /// rate at the last decrease: probe slowly just below it (fewer loss bursts), normally above it
+    wmax: Option<u32>,
 }
 
 impl PushRate {
     pub fn new() -> PushRate {
-        PushRate { rate: PUSH_BEST, base: None }
+        PushRate { rate: PUSH_START, base: None, rtt0: None, hold: 0, wmax: None }
     }
 
     /// Client's cumulative counts over all push connections: `sent` = messages the host sent (highest seq + 1),
-    /// `recv` = messages received. Some(loss) when the rate was re-evaluated.
-    pub fn on_report(&mut self, sent: u64, recv: u64) -> Option<f64> {
+    /// `recv` = messages received; `rtt` = highest ping over the push connections now (ms, <= 0 unknown).
+    /// Some(loss) when the rate was re-evaluated.
+    pub fn on_report(&mut self, sent: u64, recv: u64, rtt: i32) -> Option<f64> {
+        if rtt > 0 {
+            self.rtt0 = Some(self.rtt0.map_or(rtt, |r| r.min(rtt)));
+        }
         let Some((s0, r0)) = self.base else {
             self.base = Some((sent, recv)); // first report: baseline only
             return None;
         };
         let ds = sent.saturating_sub(s0);
+        if sent < s0 || recv < r0 {
+            self.base = Some((sent, recv)); // counters went back (client restarted): new baseline
+            return None;
+        }
         if ds < 50 {
             return None; // too few to judge; keep accumulating
         }
         self.base = Some((sent, recv));
         let loss = (1.0 - recv.saturating_sub(r0) as f64 / ds as f64).max(0.0);
-        let r = if loss > 0.03 {
-            self.rate as f64 * 0.8
-        } else if loss < 0.01 {
-            self.rate as f64 * 1.05
+        if self.hold > 0 {
+            self.hold -= 1;
+            return Some(loss);
+        }
+        let rise = self.rtt0.filter(|_| rtt > 0).map_or(0, |r0| rtt - r0);
+        let r = if loss > LOSS_HI || rise > RTT_HI {
+            self.hold = 1;
+            self.wmax = Some(self.rate);
+            (self.rate as f64 * PUSH_DOWN) as u32
+        } else if loss < LOSS_OK && rise <= RTT_OK {
+            let near = self.wmax.is_some_and(|w| self.rate >= w / 10 * 9 && self.rate < w);
+            self.rate + if near { PUSH_ADD / 4 } else { PUSH_ADD }
         } else {
-            self.rate as f64
+            self.rate
         };
-        self.rate = (r as u32).clamp(PUSH_MIN, PUSH_MAX);
+        self.rate = r.clamp(PUSH_MIN, PUSH_MAX);
         Some(loss)
     }
 }
@@ -363,21 +399,37 @@ mod tests {
     #[test]
     fn rate_control() {
         let mut r = PushRate::new();
-        assert_eq!(r.on_report(100, 0), None); // baseline only
-        assert_eq!(r.on_report(120, 10), None); // < 50 new: wait
-        assert_eq!(r.on_report(200, 100), Some(0.0)); // 100 sent, 100 got
-        let up = (PUSH_BEST as f64 * 1.05) as u32;
+        assert_eq!(r.on_report(100, 0, 100), None); // baseline only
+        assert_eq!(r.rtt0, Some(100));
+        assert_eq!(r.on_report(120, 10, 0), None); // < 50 new: wait
+        assert_eq!(r.on_report(200, 100, 105), Some(0.0)); // 100 sent, 100 got, RTT +5
+        let up = PUSH_START + PUSH_ADD;
         assert_eq!(r.rate, up);
-        r.on_report(300, 190); // 10 % loss -> -20 %
-        assert_eq!(r.rate, (up as f64 * 0.8) as u32);
-        r.on_report(400, 288); // 2 %: hold
-        assert_eq!(r.rate, (up as f64 * 0.8) as u32);
-        for i in 0..20 {
-            r.on_report(500 + i * 100, 388 + i * 50); // 50 % loss
+        let down = (up as f64 * PUSH_DOWN) as u32;
+        r.on_report(300, 190, 100); // 10 % loss -> decrease
+        assert_eq!(r.rate, down);
+        r.on_report(400, 290, 100); // clean, but held one report after a decrease
+        assert_eq!(r.rate, down);
+        r.on_report(500, 387, 100); // 3 %: hold
+        assert_eq!(r.rate, down);
+        r.on_report(600, 487, 140); // no loss, RTT +40 (queue) -> decrease
+        assert_eq!(r.rate, (down as f64 * PUSH_DOWN) as u32);
+        r.on_report(700, 587, 140);
+        r.on_report(800, 687, 120); // RTT +20: neither up nor down
+        assert_eq!(r.rate, (down as f64 * PUSH_DOWN) as u32);
+        for i in 0..40 {
+            r.on_report(900 + i * 100, 737 + i * 50, 100); // 50 % loss
         }
         assert_eq!(r.rate, PUSH_MIN);
-        for i in 0..40 {
-            r.on_report(3000 + i * 100, 3000 + i * 100);
+        let w = r.wmax.unwrap();
+        assert!(w < PUSH_MIN * 12 / 10);
+        assert_eq!(r.on_report(10, 10, 100), None); // client counters restarted: new baseline
+        (r.rate, r.wmax) = (1_900_000, Some(2_000_000));
+        r.on_report(110, 110, 100);
+        assert_eq!(r.rate, 1_900_000 + PUSH_ADD / 4); // just below the last loss point: slow probe
+        r.wmax = Some(500_000);
+        for i in 1..60 {
+            r.on_report(10 + i * 100, 10 + i * 100, 100);
         }
         assert_eq!(r.rate, PUSH_MAX);
     }

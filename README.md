@@ -138,6 +138,30 @@ Then in Factorio: Multiplayer -> Connect to address -> `127.0.0.1:34200`.
   2 x 1.0 1.91-1.93 MB/s <= 1.1 %, 3 x 0.8 2.27-2.31 MB/s 0.2-2.1 %, 3 x 1.0 2.69-2.87 MB/s up to 7.1 %,
   4 x 1.0 3.6-3.8 MB/s up to 6.3 %. `--sbench N` (host) / `--sbench N --sbench-rate B/s [--sbench-warm 5 --sbench-secs 20]`
   (client) reruns it. Local e2e, 5 MB map, relayed ~116 ms: v0.5.0 910-917 KB/s, v0.6.0 1.2-1.6 MB/s (3 s), no desync.
+- Push v0.7.0: the client says hello `sdr-accel-3` as soon as its tunnel is READY (game still in its menu); a v0.7.0
+  host creates the peer, acks with the number of virtual ports it listens on (8), and the client opens 5 push
+  connections right away and keeps them for the whole session (idle Steam connections cost nothing; closed ones are
+  reopened after 5 s, and a client dropped by the host says hello again). Client reports also keep the host's peer
+  alive. Rate control (host, total over the connections, at most 1 MB/s each): AIMD on the 250 ms reports, start
+  3.2 MB/s, +100 KB/s per clean report (loss < 2 %, RTT < idle RTT + 15 ms; +25 KB/s just below the rate of the last
+  decrease), x0.85 on loss > 5 % or RTT > idle RTT + 30 ms (queue build-up), then one report hold; bounds 0.5-4.5 MB/s.
+  Blocks go to the next connection whose Steam send buffer is not full (one backed-up connection stalled all of them),
+  and the push seq is taken when Steam accepts a message, so host-side drops no longer read as wire loss. Prefetch
+  window 256 blocks (32 kept the local server's answers at ~1.3 MB/s). Lost blocks are re-asked in batches
+  (`sdr-rq` + u32 blocks) over the push connections; the replies go back over them too. v0.6.0 hosts / clients:
+  the v2 / v1 hellos are still sent and answered (3 connections at download start, or the session).
+  Bench 2026-11-11 SERVER -> this PC (vie relay, ~98 ms), 5 + 20 s, 1200 B, 2 rounds, N x per-connection rate:
+  4 x 0.8 2.96-3.09 MB/s 0-4 %; 4 x 1.0 3.86 MB/s 0-0.1 % (4 rounds); 4 x 1.2 3.58-3.68 MB/s 21-23 %;
+  5 x 0.8 3.68-3.86 MB/s 0.1-4.7 %; 5 x 0.9 4.06-4.09 MB/s 5.9-6.5 %; 5 x 1.0 3.1-3.5 MB/s 27-36 %;
+  6 x 0.67 3.80-3.86 MB/s 0-1.5 %; 6 x 0.8 2.77-3.6 MB/s 22-40 %; 8 x 0.5 3.86 MB/s 0 %; 8 x 1.0 2.0-2.4 MB/s 69-70 %.
+  The total, not N, sets the limit: ~4.0 MB/s offered = 3.86 MB/s goodput clean, above ~4.2 loss explodes and goodput
+  collapses; RTT stays flat (p95 <= 107 ms), so loss is the signal. 3 parallel TCP downloads on the same PC: 4.14 MB/s,
+  so this is the PC's 35 Mbit/s link, not SDR.
+  Local e2e (Factorio 2.1.24 server + client on this PC, both tunnel ends here, relayed vie ~115 ms, 3 runs each,
+  Factorio's ConnectedDownloadingMap -> ConnectedLoadingMap): 4.9 MB map v0.6.0 3.6-8.7 s (median 3.9), v0.7.0
+  1.67-1.76 s (median 1.74); 18.2 MB map v0.6.0 8.8-10.7 s (median 9.4, 1.95 MB/s), v0.7.0 5.5-7.0 s (median 6.5,
+  2.8 MB/s; 3.3-3.5 MB/s once the rate settles). Mixed v0.6.0 / v0.7.0 both ways: joins, v0.6.0 speed. 30 s play,
+  no desync. Game session RTT while pushing (Steam estimate, `PUSHRX` log line once a second): 113-115 ms vs 114-115 ms idle.
 
 ## Logs
 

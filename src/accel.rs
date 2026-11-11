@@ -15,7 +15,7 @@ const BLK: u8 = 13;
 const CONNECT: u8 = 2; // ConnectionRequest: a (re)join -> new map, block numbers restart
 const IDLE_RESET: Duration = Duration::from_secs(30);
 const CACHE_MAX: usize = 64 << 20;
-const WINDOW: usize = 32;
+const WINDOW: usize = 256;
 const RETRY: Duration = Duration::from_millis(200);
 const TRIES: u8 = 3;
 /// Client: a block this far behind the newest push is lost, not reordered.
@@ -32,6 +32,30 @@ pub const HELLO: &[u8] = b"sdr-accel-1";
 pub const HELLO2: &[u8] = b"sdr-accel-2";
 /// Client -> host on the control channel: REPORT + u64 LE received + u64 LE sent (highest seq + 1), over all push connections.
 pub const REPORT: &[u8] = b"sdr-rx";
+/// v3, client -> host at session start (an older host ignores it): host acks with HELLO3 + u8 = virtual ports it listens on,
+/// the client opens its push connections right away and keeps them for the whole session.
+pub const HELLO3: &[u8] = b"sdr-accel-3";
+/// v3, client -> host on a push connection: RQ + u32 LE block numbers = batched re-requests.
+pub const RQ: &[u8] = b"sdr-rq";
+pub const RQ_MAX: usize = 256;
+
+/// Batched re-request messages for these blocks.
+pub fn rq_msgs(blocks: &[u32]) -> Vec<Vec<u8>> {
+    blocks
+        .chunks(RQ_MAX)
+        .map(|c| {
+            let mut m = RQ.to_vec();
+            c.iter().for_each(|n| m.extend_from_slice(&n.to_le_bytes()));
+            m
+        })
+        .collect()
+}
+
+/// Block numbers in a batched re-request; None = not one.
+pub fn rq_parse(d: &[u8]) -> Option<Vec<u32>> {
+    let b = d.strip_prefix(RQ)?;
+    (b.len() % 4 == 0 && b.len() <= RQ_MAX * 4).then(|| b.chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect())
+}
 
 #[derive(Debug, PartialEq)]
 pub enum Pkt {
@@ -375,8 +399,8 @@ impl Accel {
         }
     }
 
-    /// Client, every loop pass: requests to forward (lost pushes, stale asks); drops an idle download.
-    pub fn tick(&mut self) -> Vec<Vec<u8>> {
+    /// Client, every loop pass: blocks to ask the host for again (lost pushes, stale asks); drops an idle download.
+    pub fn tick(&mut self) -> Vec<u32> {
         let mut out = Vec::new();
         if self.started.is_some() && self.last.elapsed() > IDLE_RESET {
             self.reset("idle");
@@ -388,14 +412,14 @@ impl Accel {
         for (&n, t) in self.missing.iter_mut() {
             if n.saturating_add(LOST_GAP) <= hi && t.is_none_or(|t| t.elapsed() >= LOST_REASK) {
                 *t = Some(now);
-                out.push(request(n));
+                out.push(n);
             }
         }
         // asked for, neither pushed nor known lost: the push stream ended / host stopped (end guess, cache full)
         for (&n, t) in self.wanted.iter_mut() {
             if t.elapsed() >= if stalled { LOST_REASK } else { STALE_REASK } && !self.missing.contains_key(&n) {
                 *t = now;
-                out.push(request(n));
+                out.push(n);
             }
         }
         out
@@ -480,9 +504,15 @@ mod tests {
         assert!(a.tick().is_empty()); // re-ask only after LOST_REASK
         assert!(a.client_from_tunnel(&blk(3))); // the game asked for 3: delivered
         a.wanted.insert(300, Instant::now() - STALE_REASK);
-        assert_eq!(a.tick(), vec![request(300)]); // host stopped pushing?
+        assert_eq!(a.tick(), vec![300]); // host stopped pushing?
         a.last_push = Instant::now() - PUSH_STALL * 2;
         assert_eq!(a.client_from_game(&request(301)), Act::Pass); // stream ended: plain forwarding
+        let rq: Vec<u32> = (0..300).collect();
+        let m = rq_msgs(&rq);
+        assert_eq!(m.len(), 2);
+        assert_eq!([rq_parse(&m[0]).unwrap(), rq_parse(&m[1]).unwrap()].concat(), rq);
+        assert_eq!(rq_parse(b"sdr-rq\x01\x02"), None);
+        assert_eq!(rq_parse(HELLO3), None);
         let mut off = Accel::new(false, "t".into());
         assert!(off.client_from_tunnel(&blk(1)));
         assert_eq!(off.client_from_game(&request(1)), Act::Pass);
