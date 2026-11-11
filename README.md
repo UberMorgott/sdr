@@ -105,6 +105,11 @@ Then in Factorio: Multiplayer -> Connect to address -> `127.0.0.1:34200`.
   Steam's own queue (`pendingUnrel`, `queue` in us).
 - `--dual-wifi`: allow Steam's dual-band Wi-Fi multipath (`DualWifi_Enable`). Off by default: on a Qualcomm
   dual-band card the second socket failed every send (`WSAENETUNREACH`, 27 retries per session).
+- Small datagrams are coalesced (Steam Nagle, `NagleTime` 2 ms; v0.4.0 and older sent each with `NoNagle`). In a real
+  map download Factorio sent ~2150 tiny datagrams/s upstream = ~1135 wire packets/s and the host got only ~45 % of
+  them (quality 0.55). Bench client -> host, 13 B: 2200/s lost 18 %, 4000/s 52 % (path passes ~1000 pkt/s); with
+  Nagle 2 ms: 0 % at 2200/s and 4000/s (~300 pkt/s on the wire), also with a parallel 0.6-1 MB/s download;
+  RTT p50 102 -> 105 ms (5 ms default: 111 ms).
 - Local UDP sockets get 4 MiB `SO_RCVBUF`/`SO_SNDBUF` (Windows default 64 KB); the read-back is logged.
 - `--ice all|private|public|off` (default `all`): allow direct P2P (ICE) besides relays. The log shows `ROUTE ... RELAYED|DIRECT`.
 

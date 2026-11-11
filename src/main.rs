@@ -157,7 +157,10 @@ fn acp_str(b: &[u8]) -> String {
 // ------------------------------------------------------------------ FFI types
 
 const IDENTITY_STEAMID: i32 = 16; // k_ESteamNetworkingIdentityType_SteamID
-const SEND_FLAGS: i32 = 0 | 1 | 32; // Unreliable | NoNagle | AutoRestartBrokenSession
+// Unreliable | AutoRestartBrokenSession. Nagle stays ON (NagleTime = NAGLE_USEC): with NoNagle each tiny Factorio
+// datagram became its own wire packet (~1100-2200 pkt/s upstream) and the relay path dropped everything over
+// ~1000 pkt/s (45 % loss in a real map download); Nagle coalesces them.
+const SEND_FLAGS: i32 = 0 | 32;
 const QUERY_PORT_SHARED: u16 = 0xffff; // MASTERSERVERUPDATERPORT_USEGAMESOCKETSHARE
 const CHANNEL: i32 = 0;
 
@@ -272,6 +275,9 @@ struct RtStatus {
 const CFG_SEND_BUFFER_SIZE: i32 = 9; // SDK default 512 KB; full -> SendMessage returns k_EResultLimitExceeded
 const CFG_SEND_RATE_MIN: i32 = 10;
 const CFG_SEND_RATE_MAX: i32 = 11;
+const CFG_NAGLE_TIME: i32 = 12; // usec, SDK default 5000
+/// 2 ms: caps tiny-message wire rate at ~500 pkt/s per direction (path drops > ~1000) for +<=2 ms latency.
+const NAGLE_USEC: i32 = 2000;
 const CFG_SCOPE_GLOBAL: i32 = 1;
 const CFG_ICE_ENABLE: i32 = 104; // P2P_Transport_ICE_Enable; values k_nSteamNetworkingConfig_P2P_Transport_ICE_Enable_*
 const CFG_DUAL_WIFI_ENABLE: i32 = 39; // DualWifi_Enable: 0 no, 1 yes, 2 simulate
@@ -1600,6 +1606,7 @@ fn main() {
             ("SendRateMin", CFG_SEND_RATE_MIN, rate_min),
             ("SendRateMax", CFG_SEND_RATE_MAX, rate_max),
             ("SendBufferSize", CFG_SEND_BUFFER_SIZE, send_buffer),
+            ("NagleTime", CFG_NAGLE_TIME, NAGLE_USEC),
             ("P2P_Transport_ICE_Enable", CFG_ICE_ENABLE, ice),
             // Off by default: on a dual-band Wi-Fi card the second socket failed every send (WSAENETUNREACH spam).
             ("DualWifi_Enable", CFG_DUAL_WIFI_ENABLE, args.iter().any(|a| a == "--dual-wifi") as i32),
