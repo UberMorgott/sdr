@@ -29,7 +29,9 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use windows_sys::core::BOOL;
-use windows_sys::Win32::Foundation::SYSTEMTIME;
+use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE, SYSTEMTIME, WAIT_OBJECT_0};
+use windows_sys::Win32::System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS};
+use windows_sys::Win32::System::Threading::{GetExitCodeProcess, OpenProcess, QueryFullProcessImageNameW, WaitForSingleObject, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE};
 use windows_sys::Win32::Globalization::{MultiByteToWideChar, CP_ACP};
 use windows_sys::Win32::Networking::WinSock::{getsockopt, setsockopt, SOL_SOCKET, SO_RCVBUF, SO_SNDBUF};
 use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
@@ -618,11 +620,110 @@ struct Play {
     wait: bool,
     child: Option<std::process::Child>,
     code: Option<i32>,
+    /// Set once the launched game exited: Factorio restarts itself (mod sync, settings), so we follow its exe.
+    respawn: Option<Respawn>,
+}
+
+/// After the launched game exits: keep the tunnel while any process with the same exe image runs
+/// (Factorio's self-restart); stop once none was seen for 5 s.
+struct Respawn {
+    img: String,
+    procs: HashMap<u32, HANDLE>,
+    last_scan: Instant,
+    none_since: Instant,
+}
+
+/// Full image path, lowercased, without the \\?\ prefix (the form QueryFullProcessImageNameW compares to).
+fn norm_path(p: &str) -> String {
+    let c = std::fs::canonicalize(p).map(|c| c.to_string_lossy().into_owned()).unwrap_or_else(|_| p.to_string());
+    c.trim_start_matches(r"\\?\").to_lowercase()
+}
+
+/// PIDs of live processes (other than us) whose image path is `img` (normalized).
+fn same_image_pids(img: &str) -> Vec<u32> {
+    let name = img.rsplit('\\').next().unwrap_or(img);
+    let me = std::process::id();
+    let mut out = Vec::new();
+    // SAFETY (whole fn): snapshot/process handles are checked and closed; buffers sized as passed.
+    unsafe {
+        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snap == INVALID_HANDLE_VALUE {
+            return out;
+        }
+        let mut e: PROCESSENTRY32W = std::mem::zeroed();
+        e.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+        let mut ok = Process32FirstW(snap, &mut e);
+        while ok != 0 {
+            let n = e.szExeFile.iter().position(|&c| c == 0).unwrap_or(e.szExeFile.len());
+            if e.th32ProcessID != me && String::from_utf16_lossy(&e.szExeFile[..n]).to_lowercase() == name {
+                let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, e.th32ProcessID);
+                if !h.is_null() {
+                    let mut buf = [0u16; 1024];
+                    let mut len = buf.len() as u32;
+                    if QueryFullProcessImageNameW(h, PROCESS_NAME_WIN32, buf.as_mut_ptr(), &mut len) != 0
+                        && String::from_utf16_lossy(&buf[..len as usize]).to_lowercase() == img
+                    {
+                        out.push(e.th32ProcessID);
+                    }
+                    CloseHandle(h);
+                }
+            }
+            ok = Process32NextW(snap, &mut e);
+        }
+        CloseHandle(snap);
+    }
+    out
+}
+
+impl Respawn {
+    /// true = no game process left for 5 s. `code` gets the exit code of each tracked process that ends.
+    fn poll(&mut self, code: &mut Option<i32>) -> bool {
+        if self.last_scan.elapsed() < Duration::from_secs(1) {
+            return false;
+        }
+        self.last_scan = Instant::now();
+        for pid in same_image_pids(&self.img) {
+            if let std::collections::hash_map::Entry::Vacant(e) = self.procs.entry(pid) {
+                // SAFETY: plain OpenProcess; null checked.
+                let h = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE, 0, pid) };
+                if !h.is_null() {
+                    log!("game restarted itself? tracking pid {pid} ({})", self.img);
+                    e.insert(h);
+                }
+            }
+        }
+        self.procs.retain(|&pid, h| {
+            // SAFETY: h is an open process handle we own.
+            unsafe {
+                if WaitForSingleObject(*h, 0) != WAIT_OBJECT_0 {
+                    return true;
+                }
+                let mut c = 0u32;
+                GetExitCodeProcess(*h, &mut c);
+                CloseHandle(*h);
+                log!("game pid {pid} exited: code {}", c as i32);
+                *code = Some(c as i32);
+            }
+            false
+        });
+        if !self.procs.is_empty() {
+            self.none_since = Instant::now();
+            return false;
+        }
+        if self.none_since.elapsed() >= Duration::from_secs(5) {
+            log!("no {} process for 5 s", self.img);
+            return true;
+        }
+        false
+    }
 }
 
 impl Play {
-    /// true = stop the tunnel (game exited or could not start).
+    /// true = stop the tunnel (game, incl. its self-restarts, exited or could not start).
     fn poll(&mut self, ready: bool) -> bool {
+        if let Some(r) = &mut self.respawn {
+            return r.poll(&mut self.code);
+        }
         let r = match &mut self.child {
             None => {
                 if self.wait && !ready && self.start.elapsed() < Duration::from_secs(20) {
@@ -657,8 +758,12 @@ impl Play {
         };
         match r {
             Ok(s) => {
-                log!("game exited: {s}");
+                let img = norm_path(&self.cmd[0]);
+                log!("game exited: {s}; following {img} for 5 s in case it restarted itself");
                 self.code = Some(s.code().unwrap_or(1));
+                let past = Instant::now() - Duration::from_secs(2);
+                self.respawn = Some(Respawn { img, procs: HashMap::new(), last_scan: past, none_since: Instant::now() });
+                return self.poll(ready);
             }
             Err(e) => {
                 log!("FATAL: game {e}");
@@ -1372,6 +1477,7 @@ fn main() {
         wait: connect,
         child: None,
         code: None,
+        respawn: None,
     });
     let api = match load_api(&dll_dir) {
         Ok(a) => a,
