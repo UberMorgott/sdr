@@ -113,6 +113,10 @@ Then in Factorio: Multiplayer -> Connect to address -> `127.0.0.1:34200`.
   them (quality 0.55). Bench client -> host, 13 B: 2200/s lost 18 %, 4000/s 52 % (path passes ~1000 pkt/s); with
   Nagle 2 ms: 0 % at 2200/s and 4000/s (~300 pkt/s on the wire), also with a parallel 0.6-1 MB/s download;
   RTT p50 102 -> 105 ms (5 ms default: 111 ms).
+  Since accel answers those block requests on the client, the game channel is `NoNagle` again by default
+  (`--nagle-ms N` sets Nagle N ms; default 0, 2 with `--no-accel`; the control channel keeps 2 ms). 60 Hz 60 B echo
+  through the relay (vie/sto, 60 s runs): RTT p50 ~103.5 ms NoNagle vs ~108.5 ms Nagle 2 ms; inter-arrival p95
+  20-30 ms / p99 28-48 ms in both (that jitter is the relay path); Nagle 20 ms: RTT p50 141 ms.
 - Local UDP sockets get 4 MiB `SO_RCVBUF`/`SO_SNDBUF` (Windows default 64 KB); the read-back is logged.
 - `--ice all|private|public|off` (default `all`): allow direct P2P (ICE) besides relays. The log shows `ROUTE ... RELAYED|DIRECT`.
 - Map download accelerator (v0.5.0, on by default, `--no-accel` turns it off on either side). Factorio asks for the

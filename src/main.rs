@@ -199,10 +199,14 @@ fn acp_str(b: &[u8]) -> String {
 // ------------------------------------------------------------------ FFI types
 
 const IDENTITY_STEAMID: i32 = 16; // k_ESteamNetworkingIdentityType_SteamID
-// Unreliable | AutoRestartBrokenSession. Nagle stays ON (NagleTime = NAGLE_USEC): with NoNagle each tiny Factorio
-// datagram became its own wire packet (~1100-2200 pkt/s upstream) and the relay path dropped everything over
-// ~1000 pkt/s (45 % loss in a real map download); Nagle coalesces them.
+// Unreliable | AutoRestartBrokenSession, Nagle ON (NagleTime = NAGLE_USEC): control channel 1.
 const SEND_FLAGS: i32 = 0 | 32;
+/// k_nSteamNetworkingSend_NoNagle.
+const SEND_NO_NAGLE: i32 = 1;
+/// Game channel 0 flags (--nagle-ms). Without accel each tiny map block request was its own wire packet
+/// (~1100-2200 pkt/s upstream, relay dropped >1000 pkt/s): Nagle coalesced them. Accel answers those locally, so
+/// by default ch0 is NoNagle (no added delay on heartbeats); --no-accel keeps Nagle 2 ms.
+static GAME_SEND_FLAGS: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(SEND_FLAGS | SEND_NO_NAGLE);
 const QUERY_PORT_SHARED: u16 = 0xffff; // MASTERSERVERUPDATERPORT_USEGAMESOCKETSHARE
 const CHANNEL: i32 = 0;
 /// Accel control (client hello): an old host never reads this channel.
@@ -322,6 +326,11 @@ const CFG_SEND_RATE_MAX: i32 = 11;
 const CFG_NAGLE_TIME: i32 = 12; // usec, SDK default 5000
 /// 2 ms: caps tiny-message wire rate at ~500 pkt/s per direction (path drops > ~1000) for +<=2 ms latency.
 const NAGLE_USEC: i32 = 2000;
+
+/// Game channel send flags + global NagleTime (usec) for `--nagle-ms` (0 = NoNagle on ch0, ctl keeps 2 ms).
+fn nagle_cfg(ms: u64) -> (i32, i32) {
+    if ms == 0 { (SEND_FLAGS | SEND_NO_NAGLE, NAGLE_USEC) } else { (SEND_FLAGS, (ms * 1000).min(i32::MAX as u64) as i32) }
+}
 const CFG_SCOPE_GLOBAL: i32 = 1;
 const CFG_ICE_ENABLE: i32 = 104; // P2P_Transport_ICE_Enable; values k_nSteamNetworkingConfig_P2P_Transport_ICE_Enable_*
 const CFG_DUAL_WIFI_ENABLE: i32 = 39; // DualWifi_Enable: 0 no, 1 yes, 2 simulate
@@ -900,7 +909,7 @@ fn sdr_flush(api: &Api, msgs: P, to: u64, conn: u32, c: &mut Counters) {
                 socks::send(api, msgs, conn, &m, socks::SEND_UNRELIABLE)
             } else {
                 // SAFETY: msgs live, id/d valid for the call.
-                unsafe { (api.send)(msgs, &id, d.as_ptr().cast(), d.len() as u32, SEND_FLAGS, CHANNEL) }
+                unsafe { (api.send)(msgs, &id, d.as_ptr().cast(), d.len() as u32, GAME_SEND_FLAGS.load(Ordering::Relaxed), CHANNEL) }
             };
             if r == RESULT_LIMIT_EXCEEDED {
                 c.limit_hits += 1;
@@ -1801,6 +1810,7 @@ const USAGE: &str = "usage:\n  sdr host   [--appid 427520] [--target 127.0.0.1:3
                 [--sbench N] (bench: host listens on Sockets vports 1..N and blasts; client: + --sbench-rate B/s --sbench-warm 5 --sbench-secs 20, logs SBENCH RESULT, exits)\n\
                 [--dump <path>] (or env SDR_DUMP: every forwarded datagram, records [u64 unix_us][u8 dir 0=game->tunnel 1=tunnel->game][u32 len][bytes], LE, cap 200 MB)\n\
                 [--send-buffer <bytes>] (Steam SendBufferSize; default send-rate-max x 150 ms, min 64 KiB; Steam default 512 KB)\n\
+                [--nagle-ms N] (game channel Nagle; default 0 = NoNagle, 2 with --no-accel)\n\
      --mode: EServerMode 1=NoAuthentication 2=Authentication 3=AuthenticationAndSecure\n\
      --debug-level: Steam networking debug output 0=None 2=Error 4=Warning 5=Msg 6=Verbose 7=Debug 8=Everything\n\
      --gslt-file: Game Server Login Token file (default: gslt-<appid>.txt, then gslt.txt next to the exe; env SDR_GSLT also works);\n\
@@ -1885,7 +1895,9 @@ fn main() {
     // Steam's queue = latency: cap it at ~150 ms of sending (4 MiB was ~4 s at 1 MB/s); full -> our 50 ms retry queue.
     let send_buffer = num("--send-buffer", (rate_max as u64 * 150 / 1000).max(64 << 10)).min(i32::MAX as u64) as i32;
     let accel = !args.iter().any(|a| a == "--no-accel");
-    let ice = match opt(args, "--ice").as_deref().unwrap_or("all") {
+    let (game_flags, nagle_usec) = nagle_cfg(num("--nagle-ms", if accel { 0 } else { 2 }));
+    GAME_SEND_FLAGS.store(game_flags, Ordering::Relaxed);
+    let ice =match opt(args, "--ice").as_deref().unwrap_or("all") {
         "all" => 0x7fff_ffff,
         "private" => 2,
         "public" => 4,
@@ -1906,6 +1918,7 @@ fn main() {
     // SAFETY: handler only touches atomics and sleeps.
     let ok = unsafe { SetConsoleCtrlHandler(Some(on_ctrl), 1) };
     log!("SetConsoleCtrlHandler = {ok}");
+    log!("game channel send flags {game_flags} (NoNagle={}), NagleTime {nagle_usec} us", game_flags & SEND_NO_NAGLE != 0);
     if let Some(p) = opt(args, "--dump").or_else(|| std::env::var("SDR_DUMP").ok().filter(|s| !s.is_empty())) {
         match File::create(&p) {
             Ok(f) => {
@@ -2100,7 +2113,7 @@ fn main() {
             ("SendRateMin", CFG_SEND_RATE_MIN, rate_min),
             ("SendRateMax", CFG_SEND_RATE_MAX, rate_max),
             ("SendBufferSize", CFG_SEND_BUFFER_SIZE, send_buffer),
-            ("NagleTime", CFG_NAGLE_TIME, NAGLE_USEC),
+            ("NagleTime", CFG_NAGLE_TIME, nagle_usec),
             ("P2P_Transport_ICE_Enable", CFG_ICE_ENABLE, ice),
             // Off by default: on a dual-band Wi-Fi card the second socket failed every send (WSAENETUNREACH spam).
             ("DualWifi_Enable", CFG_DUAL_WIFI_ENABLE, args.iter().any(|a| a == "--dual-wifi") as i32),
@@ -2189,6 +2202,12 @@ mod tests {
     fn mask_hides_token() {
         assert_eq!(mask("0123456789ABCDEF"), "token len=16, ****CDEF");
         assert_eq!(mask("abc"), "token len=3, ****");
+    }
+
+    #[test]
+    fn nagle_flags() {
+        assert_eq!(nagle_cfg(0), (33, 2000));
+        assert_eq!(nagle_cfg(5), (32, 5000));
     }
 
     #[test]
