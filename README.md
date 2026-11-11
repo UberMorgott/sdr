@@ -105,6 +105,9 @@ Then in Factorio: Multiplayer -> Connect to address -> `127.0.0.1:34200`.
   Steam's own queue (`pendingUnrel`, `queue` in us).
 - `--dual-wifi`: allow Steam's dual-band Wi-Fi multipath (`DualWifi_Enable`). Off by default: on a Qualcomm
   dual-band card the second socket failed every send (`WSAENETUNREACH`, 27 retries per session).
+- `--dump <path>` (or env `SDR_DUMP`): append every forwarded datagram to a binary file (overwritten per run, stops
+  at 200 MB). Record, little-endian: `[u64 unix micros][u8 dir: 0 game->tunnel, 1 tunnel->game][u32 len][bytes]`.
+  Host role: all peers in one file, no peer id. Off by default.
 - Small datagrams are coalesced (Steam Nagle, `NagleTime` 2 ms; v0.4.0 and older sent each with `NoNagle`). In a real
   map download Factorio sent ~2150 tiny datagrams/s upstream = ~1135 wire packets/s and the host got only ~45 % of
   them (quality 0.55). Bench client -> host, 13 B: 2200/s lost 18 %, 4000/s 52 % (path passes ~1000 pkt/s); with

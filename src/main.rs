@@ -72,6 +72,46 @@ fn log_line(s: &str) {
     }
 }
 
+// ------------------------------------------------------------------ datagram dump (--dump / SDR_DUMP)
+
+/// Open dump file + bytes written; writes stop at DUMP_MAX.
+static DUMP: OnceLock<std::sync::Mutex<(File, u64)>> = OnceLock::new();
+const DUMP_MAX: u64 = 200 << 20;
+const DIR_GAME_TO_TUNNEL: u8 = 0;
+const DIR_TUNNEL_TO_GAME: u8 = 1;
+
+/// Record: [u64 LE unix micros][u8 dir][u32 LE len][bytes].
+fn dump_record(micros: u64, dir: u8, data: &[u8]) -> Vec<u8> {
+    let mut r = Vec::with_capacity(13 + data.len());
+    r.extend_from_slice(&micros.to_le_bytes());
+    r.push(dir);
+    r.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    r.extend_from_slice(data);
+    r
+}
+
+fn dump(dir: u8, data: &[u8]) {
+    let Some(m) = DUMP.get() else { return };
+    let Ok(mut g) = m.lock() else { return };
+    if g.1 >= DUMP_MAX {
+        return;
+    }
+    let micros = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_micros() as u64);
+    let r = dump_record(micros, dir, data);
+    if g.1 + r.len() as u64 > DUMP_MAX {
+        g.1 = DUMP_MAX;
+        log!("dump: {} MB cap reached, dump stopped", DUMP_MAX >> 20);
+        return;
+    }
+    match g.0.write_all(&r) {
+        Ok(()) => g.1 += r.len() as u64,
+        Err(e) => {
+            g.1 = DUMP_MAX;
+            log!("dump: write failed: {e}; dump stopped");
+        }
+    }
+}
+
 fn log_init(mut file: Option<File>) {
     let (tx, rx) = sync_channel::<String>(8192);
     std::thread::spawn(move || {
@@ -1013,6 +1053,7 @@ impl Ctx {
                     }
                     peer.c.rx_pkts += 1;
                     peer.c.rx_bytes += data.len() as u64;
+                    dump(DIR_TUNNEL_TO_GAME, &data);
                     if let Err(e) = peer.sock.send_to(&data, *target) {
                         log!("peer {from}: send_to {target} failed: {e}");
                     }
@@ -1029,6 +1070,7 @@ impl Ctx {
                     c.rx_bytes += data.len() as u64;
                     match local {
                         Some(a) => {
+                            dump(DIR_TUNNEL_TO_GAME, &data);
                             if let Err(e) = sock.send_to(&data, *a) {
                                 log!("send_to local {a} failed: {e}");
                             }
@@ -1059,6 +1101,7 @@ impl Ctx {
                                 *local = Some(src);
                             }
                         }
+                        dump(DIR_GAME_TO_TUNNEL, &buf[..n]);
                         sdr_send(api, msgs, to, &buf[..n], c);
                         pkts += 1;
                         bytes += n;
@@ -1330,6 +1373,7 @@ const USAGE: &str = "usage:\n  sdr host   [--appid 427520] [--target 127.0.0.1:3
            --connect appends --mp-connect 127.0.0.1:<port> to the game command; log sdr.log next to the exe (overwritten)\n\
      all roles: [--send-rate 1000000] (bytes/s, sets SendRateMin = SendRateMax; Steam default 256 KB/s; --send-rate-min/-max override one side)\n\
                 [--ice all|private|public|off] [--dual-wifi]\n\
+                [--dump <path>] (or env SDR_DUMP: every forwarded datagram, records [u64 unix_us][u8 dir 0=game->tunnel 1=tunnel->game][u32 len][bytes], LE, cap 200 MB)\n\
                 [--send-buffer <bytes>] (Steam SendBufferSize; default send-rate-max x 150 ms, min 64 KiB; Steam default 512 KB)\n\
      --mode: EServerMode 1=NoAuthentication 2=Authentication 3=AuthenticationAndSecure\n\
      --debug-level: Steam networking debug output 0=None 2=Error 4=Warning 5=Msg 6=Verbose 7=Debug 8=Everything\n\
@@ -1435,6 +1479,15 @@ fn main() {
     // SAFETY: handler only touches atomics and sleeps.
     let ok = unsafe { SetConsoleCtrlHandler(Some(on_ctrl), 1) };
     log!("SetConsoleCtrlHandler = {ok}");
+    if let Some(p) = opt(args, "--dump").or_else(|| std::env::var("SDR_DUMP").ok().filter(|s| !s.is_empty())) {
+        match File::create(&p) {
+            Ok(f) => {
+                let _ = DUMP.set(std::sync::Mutex::new((f, 0)));
+                log!("dump: every forwarded datagram -> {p} (cap {} MB)", DUMP_MAX >> 20);
+            }
+            Err(e) => log!("dump: cannot create {p}: {e}; no dump"),
+        }
+    }
 
     let steam_env: Vec<(&'static str, Option<std::ffi::OsString>)> =
         ["SteamAppId", "SteamGameId"].into_iter().map(|k| (k, std::env::var_os(k))).collect();
@@ -1675,5 +1728,12 @@ mod tests {
     fn mask_hides_token() {
         assert_eq!(mask("0123456789ABCDEF"), "token len=16, ****CDEF");
         assert_eq!(mask("abc"), "token len=3, ****");
+    }
+
+    #[test]
+    fn dump_record_layout() {
+        let r = dump_record(0x0102030405060708, DIR_TUNNEL_TO_GAME, &[0xAA, 0xBB, 0xCC]);
+        assert_eq!(r, [8, 7, 6, 5, 4, 3, 2, 1, 1, 3, 0, 0, 0, 0xAA, 0xBB, 0xCC]);
+        assert_eq!(dump_record(0, DIR_GAME_TO_TUNNEL, &[]).len(), 13);
     }
 }
