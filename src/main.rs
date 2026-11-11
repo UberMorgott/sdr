@@ -272,6 +272,7 @@ const CFG_SEND_RATE_MIN: i32 = 10;
 const CFG_SEND_RATE_MAX: i32 = 11;
 const CFG_SCOPE_GLOBAL: i32 = 1;
 const CFG_ICE_ENABLE: i32 = 104; // P2P_Transport_ICE_Enable; values k_nSteamNetworkingConfig_P2P_Transport_ICE_Enable_*
+const CFG_DUAL_WIFI_ENABLE: i32 = 39; // DualWifi_Enable: 0 no, 1 yes, 2 simulate
 
 const _: () = {
     use std::mem::{offset_of, size_of};
@@ -1197,7 +1198,7 @@ const DEFAULT_APPID: u64 = 427520; // Factorio; SDR host READY + client echo ver
 const USAGE: &str = "usage:\n  sdr host   [--appid 427520] [--target 127.0.0.1:34197] [--game-port 27016] [--mode 2] [--idle 60] [--debug-level 5] [--gslt-file <path>]\n  sdr client [--appid 427520] --host <SteamID64> [--listen 127.0.0.1:34200] [--debug-level 5]\n  sdr play   [--appid 427520] --host <SteamID64> [--port 34200] [--connect] [--debug-level 5] -- <game exe> [game args...]\n\
      play: client tunnel on 127.0.0.1:<port> (busy -> a free port, logged), runs the game, exits with the game's exit code;\n\
            --connect appends --mp-connect 127.0.0.1:<port> to the game command; log sdr.log next to the exe (overwritten)\n\
-     all roles: [--send-rate-min 1000000] [--send-rate-max 10000000] (bytes/s, Steam default 256 KB/s) [--ice all|private|public|off] \n\
+     all roles: [--send-rate-min 1000000] [--send-rate-max 10000000] (bytes/s, Steam default 256 KB/s) [--ice all|private|public|off] [--dual-wifi]\n\
                 [--send-buffer 4194304] (Steam SendBufferSize bytes, Steam default 512 KB)\n\
      --mode: EServerMode 1=NoAuthentication 2=Authentication 3=AuthenticationAndSecure\n\
      --debug-level: Steam networking debug output 0=None 2=Error 4=Warning 5=Msg 6=Verbose 7=Debug 8=Everything\n\
@@ -1471,6 +1472,8 @@ fn main() {
             ("SendRateMax", CFG_SEND_RATE_MAX, rate_max),
             ("SendBufferSize", CFG_SEND_BUFFER_SIZE, send_buffer),
             ("P2P_Transport_ICE_Enable", CFG_ICE_ENABLE, ice),
+            // Off by default: on a dual-band Wi-Fi card the second socket failed every send (WSAENETUNREACH spam).
+            ("DualWifi_Enable", CFG_DUAL_WIFI_ENABLE, args.iter().any(|a| a == "--dual-wifi") as i32),
         ] {
             let ok = (api.set_cfg_i32)(utils, cfg, v);
             let (mut typ, mut val, mut cb) = (0i32, 0i32, std::mem::size_of::<i32>());
