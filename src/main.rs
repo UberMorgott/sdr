@@ -50,6 +50,7 @@ static STOP: AtomicBool = AtomicBool::new(false);
 macro_rules! log {
     ($($a:tt)*) => { log_line(&format!($($a)*)) };
 }
+mod accel;
 
 fn log_line(s: &str) {
     let mut t: SYSTEMTIME = unsafe { std::mem::zeroed() };
@@ -203,6 +204,8 @@ const IDENTITY_STEAMID: i32 = 16; // k_ESteamNetworkingIdentityType_SteamID
 const SEND_FLAGS: i32 = 0 | 32;
 const QUERY_PORT_SHARED: u16 = 0xffff; // MASTERSERVERUPDATERPORT_USEGAMESOCKETSHARE
 const CHANNEL: i32 = 0;
+/// Accel control (client hello): an old host never reads this channel.
+const CHANNEL_CTL: i32 = 1;
 
 /// SteamNetworkingIdentity, 136 bytes.
 #[repr(C)]
@@ -906,11 +909,12 @@ struct Peer {
     sock: UdpSocket,
     last: Instant,
     c: Counters,
+    acc: accel::Accel,
 }
 
 enum Role {
-    Host { target: SocketAddr, idle: Duration, peers: HashMap<u64, Peer> },
-    Client { host: u64, sock: UdpSocket, local: Option<SocketAddr>, c: Counters },
+    Host { target: SocketAddr, idle: Duration, peers: HashMap<u64, Peer>, accel: bool },
+    Client { host: u64, sock: UdpSocket, local: Option<SocketAddr>, c: Counters, acc: accel::Accel },
 }
 
 struct Ctx {
@@ -1027,7 +1031,7 @@ impl Ctx {
             };
             unsafe { (self.api.release)(m) };
             match &mut self.role {
-                Role::Host { target, peers, .. } => {
+                Role::Host { target, peers, accel, .. } => {
                     let peer = match peers.entry(from) {
                         std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
                         std::collections::hash_map::Entry::Vacant(e) => {
@@ -1044,7 +1048,7 @@ impl Ctx {
                                 sock.local_addr().map(|a| a.to_string()).unwrap_or_default(),
                                 tune_sock(&sock)
                             );
-                            e.insert(Peer { sock, last: Instant::now(), c: Counters::new() })
+                            e.insert(Peer { sock, last: Instant::now(), c: Counters::new(), acc: accel::Accel::new(*accel, format!("peer {from}")) })
                         }
                     };
                     peer.last = Instant::now();
@@ -1054,11 +1058,17 @@ impl Ctx {
                     peer.c.rx_pkts += 1;
                     peer.c.rx_bytes += data.len() as u64;
                     dump(DIR_TUNNEL_TO_GAME, &data);
-                    if let Err(e) = peer.sock.send_to(&data, *target) {
-                        log!("peer {from}: send_to {target} failed: {e}");
+                    match peer.acc.host_from_client(&data) {
+                        accel::Act::Pass => {
+                            if let Err(e) = peer.sock.send_to(&data, *target) {
+                                log!("peer {from}: send_to {target} failed: {e}");
+                            }
+                        }
+                        accel::Act::Reply(b) => sdr_send(&self.api, self.msgs, from, &b, &mut peer.c),
+                        accel::Act::Drop => {}
                     }
                 }
-                Role::Client { host, sock, local, c } => {
+                Role::Client { host, sock, local, c, acc } => {
                     if from != *host {
                         log!("ignoring {} bytes from unexpected peer {from}", data.len());
                         continue;
@@ -1069,6 +1079,7 @@ impl Ctx {
                     c.rx_pkts += 1;
                     c.rx_bytes += data.len() as u64;
                     match local {
+                        Some(_) if !acc.client_from_tunnel(&data) => {} // pushed block: cached, not asked for yet
                         Some(a) => {
                             dump(DIR_TUNNEL_TO_GAME, &data);
                             if let Err(e) = sock.send_to(&data, *a) {
@@ -1077,6 +1088,37 @@ impl Ctx {
                         }
                         None => log!("{} bytes from host but no local UDP sender seen yet; dropped", data.len()),
                     }
+                }
+            }
+        }
+        if let Role::Host { peers, .. } = &mut self.role {
+            // SAFETY: as above.
+            let k = unsafe { (self.api.recv)(self.msgs, CHANNEL_CTL, ptrs.as_mut_ptr(), 64) };
+            for &m in &ptrs[..k.max(0) as usize] {
+                let (from, hello) = unsafe {
+                    let msg = &*m;
+                    (msg.peer.steam_id, std::slice::from_raw_parts(msg.data as *const u8, msg.size.max(0) as usize) == accel::HELLO)
+                };
+                unsafe { (self.api.release)(m) };
+                if let (true, Some(p)) = (hello, peers.get_mut(&from)) {
+                    if p.acc.host_hello() {
+                        // SAFETY: msgs live, HELLO valid for the call.
+                        unsafe { (self.api.send)(self.msgs, &Identity::steam(from), accel::HELLO.as_ptr().cast(), accel::HELLO.len() as u32, SEND_FLAGS, CHANNEL_CTL) };
+                    }
+                }
+            }
+        }
+        if let Role::Client { host, acc, .. } = &mut self.role {
+            // SAFETY: as above.
+            let k = unsafe { (self.api.recv)(self.msgs, CHANNEL_CTL, ptrs.as_mut_ptr(), 64) };
+            for &m in &ptrs[..k.max(0) as usize] {
+                let (from, hello) = unsafe {
+                    let msg = &*m;
+                    (msg.peer.steam_id, std::slice::from_raw_parts(msg.data as *const u8, msg.size.max(0) as usize) == accel::HELLO)
+                };
+                unsafe { (self.api.release)(m) };
+                if hello && from == *host {
+                    acc.client_ack();
                 }
             }
         }
@@ -1089,7 +1131,7 @@ impl Ctx {
         let (api, msgs) = (&self.api, self.msgs);
         let mut any = false;
         // Bounded drain: at most DRAIN_MAX_PKTS / DRAIN_MAX_BYTES per socket, sent straight on.
-        let mut drain = |sock: &UdpSocket, to: u64, c: &mut Counters, mut on_src: Option<&mut Option<SocketAddr>>| -> bool {
+        let mut drain = |sock: &UdpSocket, to: u64, c: &mut Counters, acc: &mut accel::Accel, mut on_src: Option<&mut Option<SocketAddr>>| -> bool {
             sdr_flush(api, msgs, to, c);
             let (mut pkts, mut bytes) = (0, 0);
             while pkts < DRAIN_MAX_PKTS && bytes < DRAIN_MAX_BYTES {
@@ -1102,7 +1144,27 @@ impl Ctx {
                             }
                         }
                         dump(DIR_GAME_TO_TUNNEL, &buf[..n]);
-                        sdr_send(api, msgs, to, &buf[..n], c);
+                        if on_src.is_none() {
+                            if acc.host_from_server(&buf[..n]) {
+                                sdr_send(api, msgs, to, &buf[..n], c);
+                            }
+                        } else {
+                            let act = acc.client_from_game(&buf[..n]);
+                            if acc.client_hello() {
+                                let id = Identity::steam(to);
+                                // SAFETY: msgs live, id/HELLO valid for the call.
+                                unsafe { (api.send)(msgs, &id, accel::HELLO.as_ptr().cast(), accel::HELLO.len() as u32, SEND_FLAGS, CHANNEL_CTL) };
+                            }
+                            match act {
+                                accel::Act::Pass => sdr_send(api, msgs, to, &buf[..n], c),
+                                accel::Act::Reply(b) => {
+                                    if let Err(e) = sock.send_to(&b, src) {
+                                        log!("send_to local {src} failed: {e}");
+                                    }
+                                }
+                                accel::Act::Drop => {}
+                            }
+                        }
                         pkts += 1;
                         bytes += n;
                     }
@@ -1117,17 +1179,28 @@ impl Ctx {
             pkts > 0
         };
         match &mut self.role {
-            Role::Host { peers, .. } => {
+            Role::Host { peers, target, .. } => {
                 for (&id, p) in peers.iter_mut() {
                     let sent = p.c.tx_pkts;
-                    any |= drain(&p.sock, id, &mut p.c, None);
+                    any |= drain(&p.sock, id, &mut p.c, &mut p.acc, None);
+                    // Prefetch only while Steam takes everything (no LimitExceeded backlog): tunnel speed, no drops.
+                    for r in p.acc.host_prefetch(p.c.q.is_empty()) {
+                        if let Err(e) = p.sock.send_to(&r, *target) {
+                            log!("peer {id}: prefetch send_to {target} failed: {e}");
+                        }
+                    }
                     // Only what Steam accepted counts as activity: Factorio retrying into a dead session must not keep the peer.
                     if p.c.tx_pkts != sent {
                         p.last = Instant::now();
                     }
                 }
             }
-            Role::Client { host, sock, local, c } => any = drain(sock, *host, c, Some(local)),
+            Role::Client { host, sock, local, c, acc } => {
+                for r in acc.tick() {
+                    sdr_send(api, msgs, *host, &r, c);
+                }
+                any = drain(sock, *host, c, acc, Some(local));
+            }
         }
         any
     }
@@ -1373,6 +1446,7 @@ const USAGE: &str = "usage:\n  sdr host   [--appid 427520] [--target 127.0.0.1:3
            --connect appends --mp-connect 127.0.0.1:<port> to the game command; log sdr.log next to the exe (overwritten)\n\
      all roles: [--send-rate 1000000] (bytes/s, sets SendRateMin = SendRateMax; Steam default 256 KB/s; --send-rate-min/-max override one side)\n\
                 [--ice all|private|public|off] [--dual-wifi]\n\
+                [--no-accel] (map download accelerator off; on: host prefetches map blocks from the server and pushes them, client answers the game from that cache)\n\
                 [--dump <path>] (or env SDR_DUMP: every forwarded datagram, records [u64 unix_us][u8 dir 0=game->tunnel 1=tunnel->game][u32 len][bytes], LE, cap 200 MB)\n\
                 [--send-buffer <bytes>] (Steam SendBufferSize; default send-rate-max x 150 ms, min 64 KiB; Steam default 512 KB)\n\
      --mode: EServerMode 1=NoAuthentication 2=Authentication 3=AuthenticationAndSecure\n\
@@ -1458,6 +1532,7 @@ fn main() {
     let rate_max = num("--send-rate-max", rate).min(i32::MAX as u64) as i32;
     // Steam's queue = latency: cap it at ~150 ms of sending (4 MiB was ~4 s at 1 MB/s); full -> our 50 ms retry queue.
     let send_buffer = num("--send-buffer", (rate_max as u64 * 150 / 1000).max(64 << 10)).min(i32::MAX as u64) as i32;
+    let accel = !args.iter().any(|a| a == "--no-accel");
     let ice = match opt(args, "--ice").as_deref().unwrap_or("all") {
         "all" => 0x7fff_ffff,
         "private" => 2,
@@ -1587,7 +1662,7 @@ fn main() {
         }
         user = std::ptr::null_mut();
         log!("SteamGameServer_GetHSteamPipe = {pipe}; ISteamGameServer={gs:p} ISteamNetworkingMessages(gs)={msgs:p} ISteamNetworkingSockets(gs)={sockets:p}");
-        role_state = Role::Host { target, idle: Duration::from_secs(num("--idle", 60)), peers: HashMap::new() };
+        role_state = Role::Host { target, idle: Duration::from_secs(num("--idle", 60)), peers: HashMap::new(), accel };
     } else {
         let host: u64 = opt(args, "--host").and_then(|v| v.parse().ok()).unwrap_or_else(|| usage());
         let listen = if is_play {
@@ -1630,7 +1705,7 @@ fn main() {
         if let (Some(p), true) = (&mut play, connect) {
             p.cmd.extend(["--mp-connect".to_string(), local]);
         }
-        role_state = Role::Client { host, sock, local: None, c: Counters::new() };
+        role_state = Role::Client { host, sock, local: None, c: Counters::new(), acc: accel::Accel::new(accel, "client".into()) };
     }
     // steam_api.h: "must be called after SteamAPI_Init" (before it, no callback is ever delivered).
     // SAFETY: init succeeded.

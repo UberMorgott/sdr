@@ -115,6 +115,16 @@ Then in Factorio: Multiplayer -> Connect to address -> `127.0.0.1:34200`.
   RTT p50 102 -> 105 ms (5 ms default: 111 ms).
 - Local UDP sockets get 4 MiB `SO_RCVBUF`/`SO_SNDBUF` (Windows default 64 KB); the read-back is logged.
 - `--ice all|private|public|off` (default `all`): allow direct P2P (ICE) besides relays. The log shows `ROUTE ... RELAYED|DIRECT`.
+- Map download accelerator (v0.5.0, on by default, `--no-accel` turns it off on either side). Factorio asks for the
+  map block by block (TransferBlockRequest type 12 `[b0][u32 block]`, TransferBlock type 13 `[b0][u32 block][503 B]`)
+  under a congestion window that backs off once the tunnel queue delays its requests (capture: 940 KB/s for 5 s, then
+  a 2.4 s tail at ~100 KB/s, 9572 re-requests). With accel the client says hello on SDR channel 1; the host acks,
+  prefetches every block from the local server (32 outstanding, only while Steam takes more, retry 200 ms x3; three
+  unanswered = end of map) and pushes them at tunnel speed; the client caches them, answers the game locally and
+  re-asks blocks the push stream skipped. An old host never reads channel 1 and an old client never says hello, so
+  mixed versions fall back to plain forwarding. Odd type 12/13 datagrams, a cache over 64 MB or a reconnect switch it
+  off / reset it (`ACCEL` log lines). Local test, 5.5 MB map, relayed ~116 ms: off 390-728 KB/s (median 602, 7-14 s),
+  on 770-921 KB/s (median 915, 6-7 s; at `--send-rate` 1 MB/s that is the tunnel limit).
 
 ## Logs
 
