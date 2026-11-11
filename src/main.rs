@@ -51,6 +51,7 @@ macro_rules! log {
     ($($a:tt)*) => { log_line(&format!($($a)*)) };
 }
 mod accel;
+mod socks;
 
 fn log_line(s: &str) {
     let mut t: SYSTEMTIME = unsafe { std::mem::zeroed() };
@@ -409,6 +410,15 @@ struct Api {
     pop_count: unsafe extern "C" fn(P) -> i32,
     pop_list: unsafe extern "C" fn(P, *mut u32, i32) -> i32,
     ping_dc: unsafe extern "C" fn(P, u32, *mut u32) -> i32,
+    // ISteamNetworkingSockets connections
+    listen_p2p: unsafe extern "C" fn(P, i32, i32, *const socks::CfgVal) -> u32,
+    connect_p2p: unsafe extern "C" fn(P, *const Identity, i32, i32, *const socks::CfgVal) -> u32,
+    accept_conn: unsafe extern "C" fn(P, u32) -> i32,
+    close_conn: unsafe extern "C" fn(P, u32, i32, *const c_char, u8) -> u8,
+    send_conn: unsafe extern "C" fn(P, u32, *const c_void, u32, i32, *mut i64) -> i32,
+    recv_conn: unsafe extern "C" fn(P, u32, *mut *mut Msg, i32) -> i32,
+    conn_rt: unsafe extern "C" fn(P, u32, *mut RtStatus, i32, *mut c_void) -> i32,
+    set_conn_cfg_i32: unsafe extern "C" fn(P, u32, i32, i32) -> u8,
 }
 
 /// GetProcAddress by name into fn-pointer type F.
@@ -494,6 +504,14 @@ fn load_api(dir: &std::path::Path) -> Result<Api, String> {
         pop_count: s!("SteamAPI_ISteamNetworkingUtils_GetPOPCount"),
         pop_list: s!("SteamAPI_ISteamNetworkingUtils_GetPOPList"),
         ping_dc: s!("SteamAPI_ISteamNetworkingUtils_GetPingToDataCenter"),
+        listen_p2p: s!("SteamAPI_ISteamNetworkingSockets_CreateListenSocketP2P"),
+        connect_p2p: s!("SteamAPI_ISteamNetworkingSockets_ConnectP2P"),
+        accept_conn: s!("SteamAPI_ISteamNetworkingSockets_AcceptConnection"),
+        close_conn: s!("SteamAPI_ISteamNetworkingSockets_CloseConnection"),
+        send_conn: s!("SteamAPI_ISteamNetworkingSockets_SendMessageToConnection"),
+        recv_conn: s!("SteamAPI_ISteamNetworkingSockets_ReceiveMessagesOnConnection"),
+        conn_rt: s!("SteamAPI_ISteamNetworkingSockets_GetConnectionRealTimeStatus"),
+        set_conn_cfg_i32: s!("SteamAPI_ISteamNetworkingUtils_SetConnectionConfigValueInt32"),
     })
 }
 
@@ -862,18 +880,23 @@ const DRAIN_MAX_PKTS: usize = 256;
 const DRAIN_MAX_BYTES: usize = 1 << 20;
 
 /// Queue one UDP->SDR datagram behind any retries (keeps order), then send what Steam takes.
-fn sdr_send(api: &Api, msgs: P, to: u64, data: &[u8], c: &mut Counters) {
+/// `conn` != 0: a Sockets push connection (`msgs` is then the ISteamNetworkingSockets pointer) instead of the session.
+fn sdr_send(api: &Api, msgs: P, to: u64, conn: u32, data: &[u8], c: &mut Counters) {
     c.q.push_back((Instant::now(), data.to_vec()));
     c.q_bytes += data.len();
-    sdr_flush(api, msgs, to, c);
+    sdr_flush(api, msgs, to, conn, c);
 }
 
-fn sdr_flush(api: &Api, msgs: P, to: u64, c: &mut Counters) {
+fn sdr_flush(api: &Api, msgs: P, to: u64, conn: u32, c: &mut Counters) {
     let id = Identity::steam(to);
     while let Some((t, d)) = c.q.front() {
         if t.elapsed() <= RETRY_MAX_AGE {
-            // SAFETY: msgs live, id/d valid for the call.
-            let r = unsafe { (api.send)(msgs, &id, d.as_ptr().cast(), d.len() as u32, SEND_FLAGS, CHANNEL) };
+            let r = if conn != 0 {
+                socks::send(api, msgs, conn, d, socks::SEND_UNRELIABLE)
+            } else {
+                // SAFETY: msgs live, id/d valid for the call.
+                unsafe { (api.send)(msgs, &id, d.as_ptr().cast(), d.len() as u32, SEND_FLAGS, CHANNEL) }
+            };
             if r == RESULT_LIMIT_EXCEEDED {
                 c.limit_hits += 1;
                 break; // retried next loop pass
@@ -904,17 +927,73 @@ fn sdr_flush(api: &Api, msgs: P, to: u64, c: &mut Counters) {
     }
 }
 
+/// Host: one connected map-block push connection; every message = [u32 LE seq][datagram] (the client counts gaps = loss).
+struct Push {
+    h: u32,
+    c: Counters,
+    seq: u32,
+}
+
+/// Client: one push connection.
+struct PushIn {
+    h: u32,
+    up: bool,
+    got: u64,
+    /// highest seq seen + 1 = messages the host sent so far
+    exp: u64,
+}
+
 /// One remote Steam peer of the host.
 struct Peer {
     sock: UdpSocket,
     last: Instant,
     c: Counters,
     acc: accel::Accel,
+    push: Vec<Push>,
+    prate: socks::PushRate,
+}
+
+impl Peer {
+    /// Steam paces each push connection at its share of the total push rate.
+    fn apply_rate(&self, api: &Api, utils: P) {
+        for x in &self.push {
+            socks::set_rate(api, utils, x.h, (self.prate.rate as usize / self.push.len()) as i32);
+        }
+    }
 }
 
 enum Role {
     Host { target: SocketAddr, idle: Duration, peers: HashMap<u64, Peer>, accel: bool },
-    Client { host: u64, sock: UdpSocket, local: Option<SocketAddr>, c: Counters, acc: accel::Accel },
+    Client {
+        host: u64,
+        sock: UdpSocket,
+        local: Option<SocketAddr>,
+        c: Counters,
+        acc: accel::Accel,
+        /// push connections and when they were asked for
+        push: Vec<PushIn>,
+        push_at: Option<Instant>,
+        next_report: Instant,
+    },
+}
+
+/// Client: one datagram from the host (session or push connection) towards the game.
+fn client_in(sock: &UdpSocket, local: &Option<SocketAddr>, c: &mut Counters, acc: &mut accel::Accel, data: &[u8]) {
+    if c.rx_pkts == 0 {
+        log!("first datagram SDR->UDP from host: {} bytes", data.len());
+    }
+    c.rx_pkts += 1;
+    c.rx_bytes += data.len() as u64;
+    match local {
+        Some(_) if !acc.client_from_tunnel(data) => {} // pushed block: cached, not asked for yet
+        Some(a) => {
+            dump(DIR_TUNNEL_TO_GAME, data);
+            if let Err(e) = sock.send_to(data, *a) {
+                log!("send_to local {a} failed: {e}");
+            }
+        }
+        None => log!("{} bytes from host but no local UDP sender seen yet; dropped", data.len()),
+    }
 }
 
 struct Ctx {
@@ -931,6 +1010,9 @@ struct Ctx {
     play: Option<Play>,
     /// last logged (Relayed flag, relay POP) per session, to log route changes.
     routes: std::cell::RefCell<HashMap<u64, (i32, u32)>>,
+    bench: Option<socks::Bench>,
+    /// host: listen sockets of the push connections
+    listens: Vec<u32>,
 }
 
 impl Ctx {
@@ -993,6 +1075,13 @@ impl Ctx {
             }
         };
         log!("CALLBACK id={} {name} user={} size={size} {detail}", cb.id, cb.user);
+        if cb.id == 1221 && size >= 8 + std::mem::size_of::<ConnInfo>() {
+            let i = unsafe { p.add(8).cast::<ConnInfo>().read_unaligned() };
+            match &mut self.bench {
+                Some(b) => b.on_status(&self.api, self.sockets, rd_i32(0) as u32, i.state, i.listen_socket),
+                None => self.on_conn_status(rd_i32(0) as u32, &i),
+            }
+        }
         if cb.id == 1252 && size >= std::mem::size_of::<ConnInfo>() {
             // SteamNetworkingMessagesSessionFailed_t: the session is dead; don't let Factorio's retries keep the peer alive.
             let i = unsafe { p.cast::<ConnInfo>().read_unaligned() };
@@ -1048,7 +1137,7 @@ impl Ctx {
                                 sock.local_addr().map(|a| a.to_string()).unwrap_or_default(),
                                 tune_sock(&sock)
                             );
-                            e.insert(Peer { sock, last: Instant::now(), c: Counters::new(), acc: accel::Accel::new(*accel, format!("peer {from}")) })
+                            e.insert(Peer { sock, last: Instant::now(), c: Counters::new(), acc: accel::Accel::new(*accel, format!("peer {from}")), push: vec![], prate: socks::PushRate::new() })
                         }
                     };
                     peer.last = Instant::now();
@@ -1064,75 +1153,142 @@ impl Ctx {
                                 log!("peer {from}: send_to {target} failed: {e}");
                             }
                         }
-                        accel::Act::Reply(b) => sdr_send(&self.api, self.msgs, from, &b, &mut peer.c),
+                        accel::Act::Reply(b) => sdr_send(&self.api, self.msgs, from, 0, &b, &mut peer.c),
                         accel::Act::Drop => {}
                     }
                 }
-                Role::Client { host, sock, local, c, acc } => {
+                Role::Client { host, sock, local, c, acc, .. } => {
                     if from != *host {
                         log!("ignoring {} bytes from unexpected peer {from}", data.len());
                         continue;
                     }
-                    if c.rx_pkts == 0 {
-                        log!("first datagram SDR->UDP from host: {} bytes", data.len());
-                    }
-                    c.rx_pkts += 1;
-                    c.rx_bytes += data.len() as u64;
-                    match local {
-                        Some(_) if !acc.client_from_tunnel(&data) => {} // pushed block: cached, not asked for yet
-                        Some(a) => {
-                            dump(DIR_TUNNEL_TO_GAME, &data);
-                            if let Err(e) = sock.send_to(&data, *a) {
-                                log!("send_to local {a} failed: {e}");
+                    client_in(sock, local, c, acc, &data);
+                }
+            }
+        }
+        // control channel: hello / ack (v1, v2), push reports
+        // SAFETY: as above.
+        let k = unsafe { (self.api.recv)(self.msgs, CHANNEL_CTL, ptrs.as_mut_ptr(), 64) };
+        for &m in &ptrs[..k.max(0) as usize] {
+            let (from, d) = unsafe {
+                let msg = &*m;
+                (msg.peer.steam_id, std::slice::from_raw_parts(msg.data as *const u8, msg.size.max(0) as usize).to_vec())
+            };
+            unsafe { (self.api.release)(m) };
+            let hello = d == accel::HELLO || d == accel::HELLO2;
+            match &mut self.role {
+                Role::Host { peers, .. } => {
+                    let Some(p) = peers.get_mut(&from) else { continue };
+                    if hello && p.acc.host_hello() {
+                        // Ack in the client's own version: v1 -> HELLO (Messages push), v2 -> HELLO2 (client adds push connections).
+                        // SAFETY: msgs live, d valid for the call.
+                        unsafe { (self.api.send)(self.msgs, &Identity::steam(from), d.as_ptr().cast(), d.len() as u32, SEND_FLAGS, CHANNEL_CTL) };
+                    } else if d.len() == accel::REPORT.len() + 16 && d.starts_with(accel::REPORT) && !p.push.is_empty() {
+                        let k = accel::REPORT.len();
+                        let got = u64::from_le_bytes(d[k..k + 8].try_into().unwrap());
+                        let exp = u64::from_le_bytes(d[k + 8..].try_into().unwrap());
+                        let old = p.prate.rate;
+                        if let Some(loss) = p.prate.on_report(exp, got) {
+                            if p.prate.rate != old {
+                                p.apply_rate(&self.api, self.utils);
+                                log!("PUSH {from}: loss {:.1}% (client got {got} of {exp}) -> rate {} -> {} B/s", loss * 100.0, old, p.prate.rate);
                             }
                         }
-                        None => log!("{} bytes from host but no local UDP sender seen yet; dropped", data.len()),
                     }
                 }
-            }
-        }
-        if let Role::Host { peers, .. } = &mut self.role {
-            // SAFETY: as above.
-            let k = unsafe { (self.api.recv)(self.msgs, CHANNEL_CTL, ptrs.as_mut_ptr(), 64) };
-            for &m in &ptrs[..k.max(0) as usize] {
-                let (from, hello) = unsafe {
-                    let msg = &*m;
-                    (msg.peer.steam_id, std::slice::from_raw_parts(msg.data as *const u8, msg.size.max(0) as usize) == accel::HELLO)
-                };
-                unsafe { (self.api.release)(m) };
-                if let (true, Some(p)) = (hello, peers.get_mut(&from)) {
-                    if p.acc.host_hello() {
-                        // SAFETY: msgs live, HELLO valid for the call.
-                        unsafe { (self.api.send)(self.msgs, &Identity::steam(from), accel::HELLO.as_ptr().cast(), accel::HELLO.len() as u32, SEND_FLAGS, CHANNEL_CTL) };
+                Role::Client { host, acc, push, push_at, .. } => {
+                    if !hello || from != *host {
+                        continue;
                     }
-                }
-            }
-        }
-        if let Role::Client { host, acc, .. } = &mut self.role {
-            // SAFETY: as above.
-            let k = unsafe { (self.api.recv)(self.msgs, CHANNEL_CTL, ptrs.as_mut_ptr(), 64) };
-            for &m in &ptrs[..k.max(0) as usize] {
-                let (from, hello) = unsafe {
-                    let msg = &*m;
-                    (msg.peer.steam_id, std::slice::from_raw_parts(msg.data as *const u8, msg.size.max(0) as usize) == accel::HELLO)
-                };
-                unsafe { (self.api.release)(m) };
-                if hello && from == *host {
                     acc.client_ack();
+                    if d == accel::HELLO2 && push.is_empty() && acc.on {
+                        let id = Identity::steam(*host);
+                        for port in 1..=socks::PUSH_CONNS {
+                            // SAFETY: sockets live, id valid for the call, no options.
+                            let h = unsafe { (self.api.connect_p2p)(self.sockets, &id, port, 0, std::ptr::null()) };
+                            log!("PUSH ConnectP2P(host, vport {port}) = {h}");
+                            if h != 0 {
+                                push.push(PushIn { h, up: false, got: 0, exp: 0 });
+                            }
+                        }
+                        *push_at = Some(Instant::now());
+                    }
                 }
             }
         }
         n > 0
     }
 
+    /// Callback 1221 (Sockets connection state) for the push connections.
+    fn on_conn_status(&mut self, h: u32, i: &ConnInfo) {
+        let (api, sockets, utils) = (&self.api, self.sockets, self.utils);
+        // SAFETY (closes): sockets live.
+        let close = |why: &str| {
+            let ok = unsafe { (api.close_conn)(sockets, h, 0, std::ptr::null(), 0) };
+            log!("PUSH conn {h}: {why} -> CloseConnection = {ok}");
+        };
+        let from = i.peer.steam_id;
+        match &mut self.role {
+            Role::Host { peers, .. } => {
+                if i.listen_socket == 0 || !self.listens.contains(&i.listen_socket) {
+                    return;
+                }
+                match i.state {
+                    socks::STATE_CONNECTING => match peers.get(&from) {
+                        // only a peer that already talks to us over the session
+                        Some(_) => {
+                            let r = unsafe { (api.accept_conn)(sockets, h) };
+                            log!("PUSH conn {h} from {from}: AcceptConnection = {}", eres(r));
+                        }
+                        None => close("unknown peer"),
+                    },
+                    socks::STATE_CONNECTED => {
+                        if let Some(p) = peers.get_mut(&from) {
+                            p.push.push(Push { h, c: Counters::new(), seq: 0 });
+                            p.apply_rate(api, utils);
+                            log!("PUSH {from}: {} push connection(s) up, total rate {} B/s", p.push.len(), p.prate.rate);
+                        } else {
+                            close("peer gone");
+                        }
+                    }
+                    s if s > socks::STATE_CONNECTED || s == 0 => {
+                        if let Some(p) = peers.get_mut(&from) {
+                            p.push.retain(|x| x.h != h);
+                            p.apply_rate(api, utils);
+                        }
+                        close(&format!("state {}", state_name(s)));
+                    }
+                    _ => {}
+                }
+            }
+            Role::Client { push, .. } => {
+                let Some(k) = push.iter().position(|x| x.h == h) else { return };
+                match i.state {
+                    socks::STATE_CONNECTED => {
+                        push[k].up = true;
+                        log!("PUSH conn {h} connected ({} of {})", push.iter().filter(|x| x.up).count(), push.len());
+                    }
+                    s if s > socks::STATE_CONNECTED || s == 0 => {
+                        push.remove(k);
+                        close(&format!("state {}", state_name(s)));
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
     /// UDP -> SDR.
     fn pump_udp(&mut self) -> bool {
         let mut buf = [0u8; 65536];
-        let (api, msgs) = (&self.api, self.msgs);
+        let (api, msgs, sockets) = (&self.api, self.msgs, self.sockets);
         let mut any = false;
         // Bounded drain: at most DRAIN_MAX_PKTS / DRAIN_MAX_BYTES per socket, sent straight on.
-        let mut drain = |sock: &UdpSocket, to: u64, c: &mut Counters, acc: &mut accel::Accel, mut on_src: Option<&mut Option<SocketAddr>>| -> bool {
-            sdr_flush(api, msgs, to, c);
+        let mut drain = |sock: &UdpSocket, to: u64, c: &mut Counters, acc: &mut accel::Accel, mut on_src: Option<&mut Option<SocketAddr>>, push: &mut [Push]| -> bool {
+            sdr_flush(api, msgs, to, 0, c);
+            for x in push.iter_mut() {
+                sdr_flush(api, sockets, to, x.h, &mut x.c);
+            }
             let (mut pkts, mut bytes) = (0, 0);
             while pkts < DRAIN_MAX_PKTS && bytes < DRAIN_MAX_BYTES {
                 match sock.recv_from(&mut buf) {
@@ -1146,17 +1302,29 @@ impl Ctx {
                         dump(DIR_GAME_TO_TUNNEL, &buf[..n]);
                         if on_src.is_none() {
                             if acc.host_from_server(&buf[..n]) {
-                                sdr_send(api, msgs, to, &buf[..n], c);
+                                match accel::parse(&buf[..n]) {
+                                    // map blocks striped over the push connections; everything else on the session
+                                    accel::Pkt::Blk(b) if !push.is_empty() => {
+                                        let x = &mut push[socks::stripe(b, push.len())];
+                                        let mut m = x.seq.to_le_bytes().to_vec();
+                                        m.extend_from_slice(&buf[..n]);
+                                        x.seq = x.seq.wrapping_add(1);
+                                        sdr_send(api, sockets, to, x.h, &m, &mut x.c);
+                                    }
+                                    _ => sdr_send(api, msgs, to, 0, &buf[..n], c),
+                                }
                             }
                         } else {
                             let act = acc.client_from_game(&buf[..n]);
                             if acc.client_hello() {
                                 let id = Identity::steam(to);
                                 // SAFETY: msgs live, id/HELLO valid for the call.
-                                unsafe { (api.send)(msgs, &id, accel::HELLO.as_ptr().cast(), accel::HELLO.len() as u32, SEND_FLAGS, CHANNEL_CTL) };
+                                for h in [accel::HELLO2, accel::HELLO] {
+                                    unsafe { (api.send)(msgs, &id, h.as_ptr().cast(), h.len() as u32, SEND_FLAGS, CHANNEL_CTL) };
+                                }
                             }
                             match act {
-                                accel::Act::Pass => sdr_send(api, msgs, to, &buf[..n], c),
+                                accel::Act::Pass => sdr_send(api, msgs, to, 0, &buf[..n], c),
                                 accel::Act::Reply(b) => {
                                     if let Err(e) = sock.send_to(&b, src) {
                                         log!("send_to local {src} failed: {e}");
@@ -1182,9 +1350,10 @@ impl Ctx {
             Role::Host { peers, target, .. } => {
                 for (&id, p) in peers.iter_mut() {
                     let sent = p.c.tx_pkts;
-                    any |= drain(&p.sock, id, &mut p.c, &mut p.acc, None);
+                    any |= drain(&p.sock, id, &mut p.c, &mut p.acc, None, &mut p.push);
                     // Prefetch only while Steam takes everything (no LimitExceeded backlog): tunnel speed, no drops.
-                    for r in p.acc.host_prefetch(p.c.q.is_empty()) {
+                    let room = p.c.q.is_empty() && p.push.iter().all(|x| x.c.q.is_empty());
+                    for r in p.acc.host_prefetch(room) {
                         if let Err(e) = p.sock.send_to(&r, *target) {
                             log!("peer {id}: prefetch send_to {target} failed: {e}");
                         }
@@ -1195,11 +1364,40 @@ impl Ctx {
                     }
                 }
             }
-            Role::Client { host, sock, local, c, acc } => {
+            Role::Client { host, sock, local, c, acc, push, push_at, next_report } => {
                 for r in acc.tick() {
-                    sdr_send(api, msgs, *host, &r, c);
+                    sdr_send(api, msgs, *host, 0, &r, c);
                 }
-                any = drain(sock, *host, c, acc, Some(local));
+                any = drain(sock, *host, c, acc, Some(local), &mut []);
+                if push_at.is_some_and(|t| t.elapsed() > socks::PUSH_CONNECT_WAIT) && push.iter().any(|x| !x.up) {
+                    push.retain(|x| {
+                        if !x.up {
+                            // SAFETY: sockets live.
+                            unsafe { (api.close_conn)(sockets, x.h, 0, std::ptr::null(), 0) };
+                        }
+                        x.up
+                    });
+                    log!("PUSH: not connected within {} s; {} push connection(s) kept (0 = host pushes over the session)", socks::PUSH_CONNECT_WAIT.as_secs(), push.len());
+                }
+                let mut got = Vec::new();
+                for x in push.iter_mut().filter(|x| x.up) {
+                    got.clear();
+                    socks::recv(api, sockets, x.h, &mut got);
+                    any |= !got.is_empty();
+                    for d in got.iter().filter(|d| d.len() > 4) {
+                        x.got += 1;
+                        x.exp = x.exp.max(u32::from_le_bytes(d[..4].try_into().unwrap()) as u64 + 1);
+                        client_in(sock, local, c, acc, &d[4..]);
+                    }
+                }
+                if push.iter().any(|x| x.up) && Instant::now() >= *next_report {
+                    *next_report = Instant::now() + socks::REPORT_EVERY;
+                    let mut m = accel::REPORT.to_vec();
+                    m.extend_from_slice(&push.iter().map(|x| x.got).sum::<u64>().to_le_bytes());
+                    m.extend_from_slice(&push.iter().map(|x| x.exp).sum::<u64>().to_le_bytes());
+                    // SAFETY: msgs live, m valid for the call.
+                    unsafe { (api.send)(msgs, &Identity::steam(*host), m.as_ptr().cast(), m.len() as u32, SEND_FLAGS, CHANNEL_CTL) };
+                }
             }
         }
         any
@@ -1219,6 +1417,10 @@ impl Ctx {
         let Role::Host { peers, .. } = &mut self.role else { return };
         let Some(p) = peers.remove(&id) else { return };
         self.routes.borrow_mut().remove(&id);
+        for x in &p.push {
+            // SAFETY: sockets live.
+            unsafe { (self.api.close_conn)(self.sockets, x.h, 0, std::ptr::null(), 0) };
+        }
         // SAFETY: msgs live.
         let ok = unsafe { (self.api.close)(self.msgs, &Identity::steam(id)) };
         log!(
@@ -1283,6 +1485,12 @@ impl Ctx {
                 rt.usec_queue,
                 rt.usec_max_jitter
             );
+        }
+        if let Role::Host { peers, .. } = &self.role {
+            for (id, p) in peers.iter().filter(|(_, p)| !p.push.is_empty()) {
+                let per: Vec<String> = p.push.iter().map(|x| format!("{}:{}/{}", x.h, x.c.tx_pkts, x.c.limit_hits)).collect();
+                log!("PUSH {id}: rate {} B/s, conns (handle:sent/LimitExceeded) {}", p.prate.rate, per.join(" "));
+            }
         }
         for (id, s) in dead {
             self.drop_peer(id, &format!("session {}", state_name(s)));
@@ -1372,6 +1580,10 @@ impl Ctx {
             let mut busy = self.pump_callbacks();
             busy |= self.pump_sdr();
             busy |= self.pump_udp();
+            if let Some(b) = &mut self.bench {
+                let host = if let Role::Client { host, .. } = &self.role { *host } else { 0 };
+                busy |= b.pump(&self.api, self.sockets, self.utils, self.ready, host);
+            }
             let now = Instant::now();
             if now >= next_diag {
                 log!("--- diag t+{:.1} s", start.elapsed().as_secs_f32());
@@ -1447,6 +1659,7 @@ const USAGE: &str = "usage:\n  sdr host   [--appid 427520] [--target 127.0.0.1:3
      all roles: [--send-rate 1000000] (bytes/s, sets SendRateMin = SendRateMax; Steam default 256 KB/s; --send-rate-min/-max override one side)\n\
                 [--ice all|private|public|off] [--dual-wifi]\n\
                 [--no-accel] (map download accelerator off; on: host prefetches map blocks from the server and pushes them, client answers the game from that cache)\n\
+                [--sbench N] (bench: host listens on Sockets vports 1..N and blasts; client: + --sbench-rate B/s --sbench-warm 5 --sbench-secs 20, logs SBENCH RESULT, exits)\n\
                 [--dump <path>] (or env SDR_DUMP: every forwarded datagram, records [u64 unix_us][u8 dir 0=game->tunnel 1=tunnel->game][u32 len][bytes], LE, cap 200 MB)\n\
                 [--send-buffer <bytes>] (Steam SendBufferSize; default send-rate-max x 150 ms, min 64 KiB; Steam default 512 KB)\n\
      --mode: EServerMode 1=NoAuthentication 2=Authentication 3=AuthenticationAndSecure\n\
@@ -1705,7 +1918,16 @@ fn main() {
         if let (Some(p), true) = (&mut play, connect) {
             p.cmd.extend(["--mp-connect".to_string(), local]);
         }
-        role_state = Role::Client { host, sock, local: None, c: Counters::new(), acc: accel::Accel::new(accel, "client".into()) };
+        role_state = Role::Client {
+            host,
+            sock,
+            local: None,
+            c: Counters::new(),
+            acc: accel::Accel::new(accel, "client".into()),
+            push: vec![],
+            push_at: None,
+            next_report: Instant::now(),
+        };
     }
     // steam_api.h: "must be called after SteamAPI_Init" (before it, no callback is ever delivered).
     // SAFETY: init succeeded.
@@ -1760,7 +1982,27 @@ fn main() {
             None => {}
         }
     }
-    let mut ctx = Ctx { api, pipe, is_host, gs, user, msgs, sockets, utils, ready: false, role: role_state, play, routes: Default::default() };
+    // --sbench N: host listens on virtual ports 1..N and blasts what clients ask; client connects N and measures.
+    let bench = opt(args, "--sbench").map(|v| {
+        let n: usize = v.parse().unwrap_or_else(|_| usage());
+        if is_host {
+            socks::Bench::host(&api, sockets, n)
+        } else {
+            socks::Bench::client(n, num("--sbench-rate", 1_000_000) as u32, num("--sbench-warm", 5), num("--sbench-secs", 20), num("--sbench-size", 1200) as u16)
+        }
+    });
+    let mut listens = Vec::new();
+    if is_host && accel && bench.is_none() {
+        for port in 1..=socks::PUSH_CONNS {
+            // SAFETY: sockets live, no options.
+            let l = unsafe { (api.listen_p2p)(sockets, port, 0, std::ptr::null()) };
+            log!("PUSH CreateListenSocketP2P(vport {port}) = {l}");
+            if l != 0 {
+                listens.push(l);
+            }
+        }
+    }
+    let mut ctx = Ctx { api, pipe, is_host, gs, user, msgs, sockets, utils, ready: false, role: role_state, play, routes: Default::default(), bench, listens };
     ctx.run();
     let code = ctx.play.and_then(|p| p.code).unwrap_or(0);
     log!("exit {code}");

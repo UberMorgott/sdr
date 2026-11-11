@@ -125,6 +125,19 @@ Then in Factorio: Multiplayer -> Connect to address -> `127.0.0.1:34200`.
   mixed versions fall back to plain forwarding. Odd type 12/13 datagrams, a cache over 64 MB or a reconnect switch it
   off / reset it (`ACCEL` log lines). Local test, 5.5 MB map, relayed ~116 ms: off 390-728 KB/s (median 602, 7-14 s),
   on 770-921 KB/s (median 915, 6-7 s; at `--send-rate` 1 MB/s that is the tunnel limit).
+- Push connections (v0.6.0): Steam paces each connection at SendRate, and one relayed connection loses packets above
+  ~1.2 MB/s, so the pushed map blocks go over 3 extra ISteamNetworkingSockets P2P connections (same host identity and
+  GSLT; host listens on virtual ports 1-3, client `ConnectP2P`s them after the host acks hello `sdr-accel-2`), striped
+  by block number (`n % 3`), each message `[u32 seq][block]`. Game traffic and control stay on the Messages session.
+  The client reports received/sent (from the seqs) every 250 ms on channel 1; the host sets the total push rate
+  (start 2.4 MB/s, -20 % above 3 % loss, +5 % below 1 %, bounded 0.5-2.88 MB/s) split over the connections (`PUSH`
+  log lines). Connections not up within 3 s are closed: the host keeps pushing over the session (v0.5.0 behaviour).
+  Old host / old client: the v1 hello is still sent and answered, so mixed versions push over the session.
+  Bench SERVER -> Georgia (vie relay, 96 ms), 5 + 20 s, unreliable 1200 B: one Messages session at 1 MB/s 0.96 MB/s
+  3.5-5 % loss (queue RTT ~310 ms); Sockets N x rate: 1 x 1.0 0.96 MB/s 0 %, 2 x 0.8 1.54 MB/s <= 0.5 %,
+  2 x 1.0 1.91-1.93 MB/s <= 1.1 %, 3 x 0.8 2.27-2.31 MB/s 0.2-2.1 %, 3 x 1.0 2.69-2.87 MB/s up to 7.1 %,
+  4 x 1.0 3.6-3.8 MB/s up to 6.3 %. `--sbench N` (host) / `--sbench N --sbench-rate B/s [--sbench-warm 5 --sbench-secs 20]`
+  (client) reruns it. Local e2e, 5 MB map, relayed ~116 ms: v0.5.0 910-917 KB/s, v0.6.0 1.2-1.6 MB/s (3 s), no desync.
 
 ## Logs
 

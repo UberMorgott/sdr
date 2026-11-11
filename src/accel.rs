@@ -28,6 +28,10 @@ const MISSING_MAX: usize = 1 << 16;
 const PUSH_STALL: Duration = Duration::from_millis(300);
 const HELLO_EVERY: Duration = Duration::from_millis(500);
 pub const HELLO: &[u8] = b"sdr-accel-1";
+/// v2 (sent next to HELLO; an old host ignores it): host acks with HELLO2 = it takes extra Sockets push connections.
+pub const HELLO2: &[u8] = b"sdr-accel-2";
+/// Client -> host on the control channel: REPORT + u64 LE received + u64 LE sent (highest seq + 1), over all push connections.
+pub const REPORT: &[u8] = b"sdr-rx";
 
 #[derive(Debug, PartialEq)]
 pub enum Pkt {
