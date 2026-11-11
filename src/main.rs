@@ -30,6 +30,7 @@ use std::time::{Duration, Instant};
 
 use windows_sys::core::BOOL;
 use windows_sys::Win32::Foundation::SYSTEMTIME;
+use windows_sys::Win32::Globalization::{MultiByteToWideChar, CP_ACP};
 use windows_sys::Win32::Networking::WinSock::{getsockopt, setsockopt, SOL_SOCKET, SO_RCVBUF, SO_SNDBUF};
 use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
 use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
@@ -127,7 +128,23 @@ fn tune_sock(s: &UdpSocket) -> String {
 
 fn cbuf(b: &[u8]) -> String {
     let n = b.iter().position(|&c| c == 0).unwrap_or(b.len());
-    String::from_utf8_lossy(&b[..n]).into_owned()
+    acp_str(&b[..n])
+}
+
+/// Steam's text (OS error strings, e.g. WSASendTo failures) is in the ANSI code page (CP1251 on Russian Windows), not UTF-8.
+fn acp_str(b: &[u8]) -> String {
+    if let Ok(s) = std::str::from_utf8(b) {
+        return s.to_string();
+    }
+    let len = b.len().min(i32::MAX as usize) as i32;
+    // SAFETY: b is valid for len bytes; first call sizes, second fills w of that size.
+    let n = unsafe { MultiByteToWideChar(CP_ACP, 0, b.as_ptr(), len, std::ptr::null_mut(), 0) };
+    if n <= 0 {
+        return String::from_utf8_lossy(b).into_owned();
+    }
+    let mut w = vec![0u16; n as usize];
+    let n = unsafe { MultiByteToWideChar(CP_ACP, 0, b.as_ptr(), len, w.as_mut_ptr(), n) };
+    String::from_utf16_lossy(&w[..n.max(0) as usize])
 }
 
 // ------------------------------------------------------------------ FFI types
@@ -565,7 +582,7 @@ unsafe extern "C" fn steam_debug(typ: i32, msg: *const c_char) {
         String::new()
     } else {
         // SAFETY: Steam passes a NUL-terminated string.
-        unsafe { CStr::from_ptr(msg) }.to_string_lossy().into_owned()
+        acp_str(unsafe { CStr::from_ptr(msg) }.to_bytes())
     };
     // Runs on Steam's service thread: log_line only formats + try_send, never blocks.
     log!("steamnet[{t}] {}", s.trim_end());
@@ -1462,6 +1479,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use windows_sys::Win32::Globalization::GetACP;
 
     #[test]
     fn steamid_decode() {
@@ -1478,6 +1496,16 @@ mod tests {
         assert_eq!(pop_code(((b'v' as u32) << 16) | ((b'i' as u32) << 8) | b'e' as u32), "vie");
         assert_eq!(flags_desc(16 | 1), "Unauthenticated,Relayed");
         assert_eq!(flags_desc(8), "Fast direct");
+    }
+
+    #[test]
+    fn acp_decode() {
+        assert_eq!(acp_str("ok Привет".as_bytes()), "ok Привет");
+        // CP1251 "Привет" (the mojibake source on Russian Windows); only checkable where ACP is 1251.
+        if unsafe { GetACP() } == 1251 {
+            assert_eq!(acp_str(&[0xCF, 0xF0, 0xE8, 0xE2, 0xE5, 0xF2]), "Привет");
+        }
+        assert_eq!(cbuf(b"abc\0junk"), "abc");
     }
 
     #[test]
