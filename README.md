@@ -4,11 +4,11 @@ UDP <-> Steam Datagram Relay tunnel, so friends reach a UDP game server (Factori
 
 ## Players: just click Play
 
-Steam -> Factorio -> Properties -> Launch options (our server's host ID is `85568392936999921`, fixed via GSLT):
+Steam -> Factorio -> Properties -> Launch options (replace `<HOST_STEAMID>` with the host's SteamID64; the ready-to-paste line for our server is shared privately):
 
-    cmd /c "curl -sfLRz sdr.exe --remove-on-error --connect-timeout 5 -o sdr.exe https://github.com/UberMorgott/sdr/releases/latest/download/sdr.exe & .\sdr.exe play --host 85568392936999921 -- %command%"
+    cmd /c "curl -sfLRz sdr.exe --remove-on-error --connect-timeout 5 -o sdr.exe https://github.com/UberMorgott/sdr/releases/latest/download/sdr.exe & .\sdr.exe play --host <HOST_STEAMID> -- %command%"
 
-For another server replace the ID with the SteamID64 its host prints (`READY steamid=<id>`).
+The host prints its SteamID64 on start (`READY steamid=<id>`).
 Start Factorio with Steam's Play button: started outside Steam, Factorio quits at once while `sdr` holds the Steam API.
 
 What it does:
