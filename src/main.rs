@@ -838,6 +838,11 @@ impl Ctx {
             }
         };
         log!("CALLBACK id={} {name} user={} size={size} {detail}", cb.id, cb.user);
+        if cb.id == 1252 && size >= std::mem::size_of::<ConnInfo>() {
+            // SteamNetworkingMessagesSessionFailed_t: the session is dead; don't let Factorio's retries keep the peer alive.
+            let i = unsafe { p.cast::<ConnInfo>().read_unaligned() };
+            self.drop_peer(i.peer.steam_id, "session failed (callback 1252)");
+        }
     }
 
     fn pump_callbacks(&mut self) -> bool {
@@ -960,9 +965,11 @@ impl Ctx {
         match &mut self.role {
             Role::Host { peers, .. } => {
                 for (&id, p) in peers.iter_mut() {
-                    if drain(&p.sock, id, &mut p.c, None) {
+                    let sent = p.c.tx_pkts;
+                    any |= drain(&p.sock, id, &mut p.c, None);
+                    // Only what Steam accepted counts as activity: Factorio retrying into a dead session must not keep the peer.
+                    if p.c.tx_pkts != sent {
                         p.last = Instant::now();
-                        any = true;
                     }
                 }
             }
@@ -973,29 +980,35 @@ impl Ctx {
 
     fn reap_idle(&mut self) {
         let Role::Host { peers, idle, .. } = &mut self.role else { return };
-        let dead: Vec<u64> = peers.iter().filter(|(_, p)| p.last.elapsed() > *idle).map(|(&id, _)| id).collect();
+        let idle = *idle;
+        let dead: Vec<u64> = peers.iter().filter(|(_, p)| p.last.elapsed() > idle).map(|(&id, _)| id).collect();
         for id in dead {
-            let p = peers.remove(&id).unwrap();
-            self.routes.borrow_mut().remove(&id);
-            let ident = Identity::steam(id);
-            // SAFETY: msgs live.
-            let ok = unsafe { (self.api.close)(self.msgs, &ident) };
-            log!(
-                "peer {id} idle > {} s: removed (rx {} pkts/{} B, tx {} pkts/{} B), CloseSessionWithUser = {ok}",
-                idle.as_secs(),
-                p.c.rx_pkts,
-                p.c.rx_bytes,
-                p.c.tx_pkts,
-                p.c.tx_bytes
-            );
+            self.drop_peer(id, &format!("idle > {} s", idle.as_secs()));
         }
     }
 
-    fn sessions_diag(&self) {
+    /// Host: forget a peer (its local UDP socket closes, so Factorio sees a new endpoint if it comes back).
+    fn drop_peer(&mut self, id: u64, why: &str) {
+        let Role::Host { peers, .. } = &mut self.role else { return };
+        let Some(p) = peers.remove(&id) else { return };
+        self.routes.borrow_mut().remove(&id);
+        // SAFETY: msgs live.
+        let ok = unsafe { (self.api.close)(self.msgs, &Identity::steam(id)) };
+        log!(
+            "peer {id} {why}: removed (rx {} pkts/{} B, tx {} pkts/{} B), CloseSessionWithUser = {ok}",
+            p.c.rx_pkts,
+            p.c.rx_bytes,
+            p.c.tx_pkts,
+            p.c.tx_bytes
+        );
+    }
+
+    fn sessions_diag(&mut self) {
         let list: Vec<(u64, &Counters)> = match &self.role {
             Role::Host { peers, .. } => peers.iter().map(|(&id, p)| (id, &p.c)).collect(),
             Role::Client { host, c, .. } => vec![(*host, c)],
         };
+        let mut dead = Vec::new();
         for (id, c) in list {
             let ident = Identity::steam(id);
             let mut info: ConnInfo = zeroed();
@@ -1015,6 +1028,9 @@ impl Ctx {
                 c.q_bytes,
                 c.dropped
             );
+            if s == 4 || s == 5 {
+                dead.push((id, s)); // ClosedByPeer / ProblemDetectedLocally
+            }
             let route = (info.flags & 16, info.pop_relay);
             if s == 3 && self.routes.borrow_mut().insert(id, route) != Some(route) {
                 log!(
@@ -1040,6 +1056,9 @@ impl Ctx {
                 rt.usec_queue,
                 rt.usec_max_jitter
             );
+        }
+        for (id, s) in dead {
+            self.drop_peer(id, &format!("session {}", state_name(s)));
         }
     }
 
